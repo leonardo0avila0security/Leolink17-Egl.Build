@@ -51,6 +51,7 @@ enum class FileType {
     NAX,
     KIP,
     NUP,
+    NX,
     DeconstructedRomDirectory,
 };
 

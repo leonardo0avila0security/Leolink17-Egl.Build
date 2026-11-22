@@ -33,6 +33,8 @@ add_executable(tests
     video_core/spirv_fragment_shuffle.cpp
     video_core/mesh_fallback.cpp
     video_core/spirv_software_matrix.cpp
+    core/nx_archive.cpp
+    frontend_common/nx_archive.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
@@ -183,13 +185,16 @@ if (ENABLE_UPDATE_CHECKER)
         ../frontend_common/update_installer.cpp)
 endif()
 
-target_link_libraries(tests PRIVATE common core input_common video_core Opus::opus)
+target_link_libraries(tests PRIVATE common core input_common video_core frontend_common Opus::opus)
 
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)
     target_link_libraries(tests PRIVATE mcp)
 endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+
+target_compile_definitions(tests PRIVATE
+    EGLANTINE_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
 
 add_test(NAME tests COMMAND tests)
 
