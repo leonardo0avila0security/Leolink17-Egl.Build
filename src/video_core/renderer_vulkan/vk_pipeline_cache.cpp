@@ -90,7 +90,7 @@ using VideoCommon::GraphicsEnvironment;
 // translated again at boot and written back under the new one. Bump MIN_COMPATIBLE_CACHE_VERSION
 // too only when the record layout (environment or key serialization) changes, which deletes older
 // caches. 20 changed the environment layout; the keys last changed before it.
-constexpr u32 CACHE_VERSION = 35; // 35: set-bit indexed texture tables get 32-element arrays
+constexpr u32 CACHE_VERSION = 36;
 static_assert(CACHE_VERSION == VideoCommon::ShaderWarm::WarmCacheVersion,
               "Shader precache files use the pipeline cache version");
 constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 20;
@@ -206,6 +206,25 @@ void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR:
     }
 }
 
+// Preserve screen-linear interpolation through clipping, as used by Bananza's map.
+// Geometry and transform feedback can observe the scaled varyings before they are restored.
+std::bitset<32> ScreenLinearGenerics(std::span<const Shader::IR::Program> programs,
+                                     const GraphicsPipelineCacheKey& key) {
+    std::bitset<32> generics;
+    const auto& fragment{programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)]};
+    const bool has_geometry{key.unique_hashes[4] != 0 ||
+                            programs[4].stage == Shader::Stage::Geometry};
+    if (fragment.stage != Shader::Stage::Fragment || has_geometry || key.state.xfb_enabled ||
+        fragment.info.loads_indexed_attributes || fragment.info.loads.Legacy()) {
+        return generics;
+    }
+    for (size_t index = 0; index < generics.size(); ++index) {
+        generics[index] = fragment.info.interpolation[index] == Shader::Interpolation::NoPerspective &&
+                          fragment.info.loads.Generic(index);
+    }
+    return generics;
+}
+
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
@@ -236,6 +255,14 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     const bool has_geometry{key.unique_hashes[4] != 0 && !programs[4].is_geometry_passthrough};
     const bool gl_ndc{key.state.ndc_minus_one_to_one != 0};
     const float point_size{std::bit_cast<float>(key.state.point_size)};
+    const bool feeds_fragment{stage == Shader::Stage::TessellationEval ||
+                              (stage == Shader::Stage::VertexB && key.unique_hashes[3] == 0)};
+    const bool after_vertex{stage == Shader::Stage::Fragment && previous_program &&
+                            (previous_program->stage == Shader::Stage::VertexB ||
+                             previous_program->stage == Shader::Stage::TessellationEval)};
+    if (feeds_fragment || after_vertex) {
+        info.screen_linear_generics = ScreenLinearGenerics(programs, key);
+    }
     switch (stage) {
     case Shader::Stage::VertexB:
         if (!has_geometry) {
