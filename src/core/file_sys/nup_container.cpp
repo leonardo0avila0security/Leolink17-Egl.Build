@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <list>
 #include <map>
@@ -21,7 +22,9 @@
 #include <zstd.h>
 
 #include "common/fs/path_util.h"
+#include "common/literals.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/swap.h"
 #include "core/file_sys/vfs/vfs_offset.h"
 #include "core/file_sys/common_funcs.h"
@@ -404,6 +407,24 @@ bool NupContainer::IsNupFile(const VirtualFile& file) {
     std::array<u8, 4> magic{};
     file->ReadObject(&magic, 0);
     return magic == HeaderMagic;
+}
+
+std::size_t NupDecompressCache::DefaultCapForHost() {
+    using namespace Common::Literals;
+    if (const char* value = std::getenv("EDEN_NX2_NUP_CACHE_MIB")) {
+        const std::size_t mib = static_cast<std::size_t>(std::strtoull(value, nullptr, 10));
+        if (mib > 0) {
+            return mib << 20;
+        }
+    }
+    const u64 host_ram = Common::GetMemInfo().TotalPhysicalMemory;
+    if (host_ram != 0 && host_ram <= 10_GiB) {
+        return 32_MiB;
+    }
+    if (host_ram != 0 && host_ram <= 18_GiB) {
+        return 48_MiB;
+    }
+    return DefaultCap;
 }
 
 NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,

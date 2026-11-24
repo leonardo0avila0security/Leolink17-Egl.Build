@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
@@ -15,6 +16,7 @@
 #include <immintrin.h>
 #endif
 #include "common/cpu_features.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -314,7 +316,24 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 #if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else
-    config.code_cache_size = std::uint32_t(512_MiB);
+    config.code_cache_size = []() -> std::uint32_t {
+        if (const char* value = std::getenv("EDEN_NX2_JIT_CACHE_MIB")) {
+            const std::size_t mib =
+                std::clamp<std::size_t>(static_cast<std::size_t>(std::strtoull(value, nullptr, 10)),
+                                        16, 512);
+            return static_cast<std::uint32_t>(mib << 20);
+        }
+        const u64 host_ram = Common::GetMemInfo().TotalPhysicalMemory;
+        // Keep enough headroom per core to avoid Dynarmic full-cache evacuations
+        // (SpaceRemaining() < 1 MiB) on large Switch 2 titles (~70-95 MiB/core active code).
+        if (host_ram != 0 && host_ram <= 10_GiB) {
+            return std::uint32_t(64_MiB);
+        }
+        if (host_ram != 0 && host_ram <= 18_GiB) {
+            return std::uint32_t(96_MiB);
+        }
+        return std::uint32_t(512_MiB);
+    }();
 #endif
 
     // Allow memory fault handling to work

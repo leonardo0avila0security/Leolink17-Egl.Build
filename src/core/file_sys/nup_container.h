@@ -40,6 +40,7 @@ struct NupSpillFile {
 /// LRU over decompressed zstd extents, shared by the files of one container.
 struct NupDecompressCache {
     static constexpr std::size_t DefaultCap = 512 * 1024 * 1024;
+    static std::size_t DefaultCapForHost();
 
     using Entry = std::pair<std::size_t, std::vector<u8>>;
 
@@ -140,7 +141,7 @@ public:
     /// Zstd members larger than half of `memory_cache_cap` are decompressed to a temporary file
     /// in `spill_dir` (the cache directory by default) instead of being held in memory.
     explicit NupContainer(VirtualFile file_,
-                          std::size_t memory_cache_cap = NupDecompressCache::DefaultCap,
+                          std::size_t memory_cache_cap = NupDecompressCache::DefaultCapForHost(),
                           std::filesystem::path spill_dir_ = {});
     ~NupContainer();
 

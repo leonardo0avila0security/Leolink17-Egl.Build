@@ -7,12 +7,16 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstring>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "common/assert.h"
+#include "common/literals.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/memory.h"
@@ -285,7 +289,17 @@ bool HardwareContext::InitializeWithType(AVHWDeviceType type) {
 DecoderContext::DecoderContext(const Decoder& decoder) : m_decoder{decoder} {
     m_codec_context = avcodec_alloc_context3(m_decoder.GetCodec());
     av_opt_set(m_codec_context->priv_data, "tune", "zerolatency", 0);
-    m_codec_context->thread_count = 0;
+    {
+        using namespace Common::Literals;
+        const u64 host_ram = Common::GetMemInfo().TotalPhysicalMemory;
+        if (host_ram != 0 && host_ram <= 18_GiB) {
+            // Auto thread_count spawns a thread per logical core in libdav1d (~85+ MiB of frame buffers).
+            m_codec_context->thread_count =
+                static_cast<int>(std::clamp<size_t>(std::thread::hardware_concurrency() / 3, 2, 4));
+        } else {
+            m_codec_context->thread_count = 0;
+        }
+    }
     m_codec_context->thread_type &= ~FF_THREAD_FRAME;
 #if defined(__ANDROID__)
     m_codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
