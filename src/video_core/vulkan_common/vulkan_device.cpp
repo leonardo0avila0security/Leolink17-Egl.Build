@@ -533,7 +533,20 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         IsFormatSupported(VK_FORMAT_D24_UNORM_S8_UINT,
                           VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, FormatType::Optimal);
 
-    supports_conditional_barriers = !is_intel_windows;
+    // A workgroup barrier that some of the group's hardware threads never reach hangs Intel GPUs:
+    // the threads that do reach it wait forever and the kernel resets the GPU (Mario Kart World's
+    // skinning compute shader on Mesa, where all lanes of a thread can skip the branch holding the
+    // barrier). Such barriers are dropped there, as on Intel's Windows driver.
+    // EDEN_CONDITIONAL_BARRIERS=1 keeps them on any driver, =0 drops them on any driver.
+    supports_conditional_barriers =
+        !is_intel_windows && driver_id != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+    if (const char* value = std::getenv("EDEN_CONDITIONAL_BARRIERS");
+        value != nullptr && (value[0] == '0' || value[0] == '1')) {
+        supports_conditional_barriers = value[0] == '1';
+    }
+    if (!supports_conditional_barriers) {
+        LOG_INFO(Render_Vulkan, "Barriers in conditional control flow are dropped");
+    }
 
     CollectPhysicalMemoryInfo();
     CollectToolingInfo();
