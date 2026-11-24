@@ -40,6 +40,7 @@
 #include "video_core/surface.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/texture_cache/accelerated_swizzle.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -1232,6 +1233,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
         if (Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed) {
             bc_encoder_pass.emplace(device, scheduler, descriptor_pool,
                                     compute_pass_descriptor_queue);
+            astc_bc_pass.emplace(device, scheduler, descriptor_pool,
+                                 compute_pass_descriptor_queue);
         }
     }
     if (!device.IsKhrImageFormatListSupported()) {
@@ -5007,6 +5010,62 @@ void TextureCacheRuntime::AccelerateImageUploadLayers(
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
+namespace {
+/// The ASTC→BCn transcode's own meter, per 5 s window: how much intermediate RGBA8 the decode
+/// images pass through and hold at their peak, against the BC bytes written. The point of the
+/// fusion work is to remove that intermediate, so this line is the before and after.
+/// EDEN_NX2_TRANSCODE_LOG=0 silences it.
+struct TranscodeMeter {
+    std::chrono::steady_clock::time_point window_start{std::chrono::steady_clock::now()};
+    u64 transcodes{};
+    u64 chunked{};
+    u64 decode_traffic{};
+    u64 output_bytes{};
+    u64 in_flight_peak{};
+    u64 resident_peak{};
+
+    void Note(u64 traffic, u64 output, bool was_chunked, u64 in_flight, u64 resident) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_TRANSCODE_LOG");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (!enabled) {
+            return;
+        }
+        ++transcodes;
+        chunked += was_chunked ? 1U : 0U;
+        decode_traffic += traffic;
+        output_bytes += output;
+        in_flight_peak = std::max(in_flight_peak, in_flight);
+        resident_peak = std::max(resident_peak, resident);
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto window =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - window_start);
+        if (window < std::chrono::seconds{5}) {
+            return;
+        }
+        constexpr double mib = 1.0 / (1024.0 * 1024.0);
+        LOG_INFO(Render_Vulkan,
+                 "ASTC BC transcode: {} in {} ms, {} chunked; RGBA8 through {:.1f} MiB, BC out "
+                 "{:.1f} MiB; decode images {:.1f} MiB in flight peak, {:.1f} MiB resident peak",
+                 transcodes, window.count(), chunked, static_cast<double>(decode_traffic) * mib,
+                 static_cast<double>(output_bytes) * mib,
+                 static_cast<double>(in_flight_peak) * mib,
+                 static_cast<double>(resident_peak) * mib);
+        window_start = now;
+        transcodes = 0;
+        chunked = 0;
+        decode_traffic = 0;
+        output_bytes = 0;
+        in_flight_peak = 0;
+        resident_peak = 0;
+    }
+};
+
+TranscodeMeter transcode_meter;
+} // Anonymous namespace
+
 u64 TextureCacheRuntime::TranscodeDecodeBytes(const PendingTranscode& t) {
     u64 bytes{};
     for (u32 level = 0; level < t.levels; ++level) {
@@ -5035,9 +5094,107 @@ void TextureCacheRuntime::RecycleTranscodes() {
     }
 }
 
+void TextureCacheRuntime::TranscodeAstcToBcnFused(
+    Image& image, const StagingBufferRef& map,
+    std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    const ImageInfo& info = image.info;
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    const u32 levels = static_cast<u32>(info.resources.levels);
+    const u32 layers = static_cast<u32>(info.resources.layers);
+    const u32 block_w = VideoCore::Surface::DefaultBlockWidth(info.format);
+    const u32 block_h = VideoCore::Surface::DefaultBlockHeight(info.format);
+    const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
+                     Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
+    const u64 block_bytes = bc3 ? 16 : 8;
+
+    // Every level of every layer into one buffer. There is no decode image to bound, so none of
+    // the two-pass path's layer chunking, recycling or waiting exists here: one buffer, one
+    // dispatch a level, then the copy into the image.
+    boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
+    u64 total = 0;
+    for (u32 level = 0; level < levels; ++level) {
+        const u32 level_width = (std::max)(width >> level, 1U);
+        const u32 level_height = (std::max)(height >> level, 1U);
+        const u32 blocks_x = Common::DivCeil(level_width, 4U);
+        const u32 blocks_y = Common::DivCeil(level_height, 4U);
+        const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
+        copies.push_back({
+            .buffer_offset = total,
+            .buffer_size = size,
+            .buffer_row_length = blocks_x * 4,
+            .buffer_image_height = blocks_y * 4,
+            .image_subresource{
+                .base_level = static_cast<s32>(level),
+                .base_layer = 0,
+                .num_layers = static_cast<s32>(layers),
+            },
+            .image_offset{0, 0, 0},
+            .image_extent{level_width, level_height, 1},
+        });
+        total += size;
+    }
+    const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
+
+    for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
+        const u32 level = static_cast<u32>(swizzle.level);
+        const u32 level_width = (std::max)(width >> level, 1U);
+        const u32 level_height = (std::max)(height >> level, 1U);
+        auto params = VideoCommon::Accelerated::MakeBlockLinearSwizzle2DParams(swizzle, info);
+        params.layer_stride = info.layer_stride;
+        const AstcBcPushConstants constants{
+            .width = level_width,
+            .height = level_height,
+            .blocks_x = Common::DivCeil(level_width, block_w),
+            .blocks_y = Common::DivCeil(level_height, block_h),
+            .srgb = VideoCore::Surface::IsPixelFormatSRGB(info.format) ? 1U : 0U,
+            .block_w = block_w,
+            .block_h = block_h,
+            .recip_w = Common::DivCeil(1U << 18, block_w),
+            .recip_h = Common::DivCeil(1U << 18, block_h),
+            .infill_ds = (1024U + block_w / 2U) / (block_w - 1U),
+            .infill_dt = (1024U + block_h / 2U) / (block_h - 1U),
+            .layer_stride = params.layer_stride,
+            .block_size = params.block_size,
+            .x_shift = params.x_shift,
+            .block_height = params.block_height,
+            .block_height_mask = params.block_height_mask,
+            .native_tiling = params.native_tiling,
+            .out_offset = static_cast<u32>(copies[level].buffer_offset / 8),
+        };
+        // MODE_BC3 : MODE_BC1 of bc_encoder.comp, and the box fit: the kind and the refined fit are
+        // specialisation constants, so this picks which pipeline the level runs (AstcBcPass).
+        constexpr bool refine = false;
+        const u32 kind = bc3 ? 1U : 0U;
+        astc_bc_pass->Run(constants, kind, refine, layers, map.buffer,
+                          map.offset + swizzle.buffer_offset,
+                          image.guest_size_bytes - swizzle.buffer_offset, output.buffer,
+                          output.offset, total);
+    }
+
+    image.UploadMemory(output.buffer, output.offset, copies);
+
+    u64 output_bytes{};
+    for (const auto& copy : copies) {
+        output_bytes += copy.buffer_size;
+    }
+    // The metre's line for this path: no RGBA8 through, and no decode image to hold.
+    transcode_meter.Note(0, output_bytes, false, 0, 0);
+}
+
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    // The fused path (astc_bc.comp): the ASTC blocks are decoded and encoded in one dispatch, so
+    // the RGBA8 image, the second dispatch, the layer chunks and the decode-image recycling are
+    // all gone. EDEN_NX2_ASTC_FUSED=0 keeps the two-pass path for an A/B.
+    static const bool fused = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_FUSED");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (fused && astc_bc_pass) {
+        return TranscodeAstcToBcnFused(image, map, swizzles);
+    }
     const ImageInfo& info = image.info;
     const u32 width = info.size.width;
     const u32 height = info.size.height;
@@ -5122,6 +5279,10 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
     const u64 block_bytes = bc3 ? 16 : 8;
+    // What this one texture costs the metre: the RGBA8 that passes through the decode images (a
+    // chunk at a time for big arrays) and the BC bytes that come out.
+    u64 decode_traffic{};
+    u64 output_bytes{};
     std::vector<u32> chunk_layer_indices(chunk_layers);
     for (u32 i = 0; i < chunk_layers; ++i) {
         chunk_layer_indices[i] = i;
@@ -5201,6 +5362,10 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
         });
         image.UploadMemory(output.buffer, output.offset, copies);
+        decode_traffic += TranscodeDecodeBytes(PendingTranscode{
+            .tick = 0, .image{}, .views{}, .layer_views{}, .width = width, .height = height,
+            .levels = levels, .layers = count, .unused_frames = 0});
+        output_bytes += total;
     }
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
@@ -5212,6 +5377,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     if (pending_transcodes.size() > 1 && in_flight > MaxInFlightTranscodeBytes) {
         scheduler.Wait(pending_transcodes.back().tick);
         RecycleTranscodes();
+    }
+    {
+        u64 resident{in_flight};
+        for (const PendingTranscode& t : free_transcodes) {
+            resident += TranscodeDecodeBytes(t);
+        }
+        transcode_meter.Note(decode_traffic, output_bytes, chunked, in_flight, resident);
     }
 }
 

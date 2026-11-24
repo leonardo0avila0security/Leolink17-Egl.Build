@@ -10,6 +10,7 @@
 #pragma once
 
 #include <functional>
+#include <array>
 #include <optional>
 #include <span>
 #include <utility>
@@ -49,6 +50,10 @@ public:
     ~ComputePass();
 
 protected:
+    /// A compute pipeline over this pass's module. `spec` fixes the module's specialisation
+    /// constants; the pipeline the constructor builds passes none.
+    vk::Pipeline CreatePipeline(const VkSpecializationInfo* spec = nullptr);
+
     const Device& device;
     vk::DescriptorUpdateTemplate descriptor_template;
     vk::PipelineLayout layout;
@@ -57,6 +62,7 @@ protected:
     DescriptorAllocator descriptor_allocator;
 
 private:
+    std::optional<u32> required_subgroup_size;
     vk::ShaderModule module;
 };
 
@@ -208,6 +214,60 @@ public:
 private:
     Scheduler& scheduler;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+};
+
+/// The block-linear geometry and the encoder's mode for one level, as astc_bc.comp declares it.
+struct AstcBcPushConstants {
+    u32 width;
+    u32 height;
+    u32 blocks_x;         ///< ASTC blocks in a row of the level
+    u32 blocks_y;
+    u32 srgb;
+    u32 block_w;          ///< the ASTC footprint
+    u32 block_h;
+    u32 recip_w;          ///< ceil(2^18 / block_w): v / block_w is (v * recip_w) >> 18
+    u32 recip_h;
+    u32 infill_ds;        ///< the weight grid infill's steps, (1024 + block_w / 2) / (block_w - 1)
+    u32 infill_dt;
+    u32 layer_stride;     ///< block-linear, from MakeBlockLinearSwizzle2DParams
+    u32 block_size;
+    u32 x_shift;
+    u32 block_height;
+    u32 block_height_mask;
+    u32 native_tiling;
+    u32 out_offset;       ///< the level's first output word, in 8-byte units
+};
+static_assert(sizeof(AstcBcPushConstants) <= 128);
+
+/// ASTC blocks straight into BC1/BC3 blocks in a buffer, one dispatch, no RGBA8 image
+/// (astc_bc.comp): the fused replacement for ASTCDecoderPass + BcEncoderPass on the
+/// re-compression path.
+class AstcBcPass final : public ComputePass {
+public:
+    explicit AstcBcPass(const Device& device_, Scheduler& scheduler_,
+                        DescriptorPool& descriptor_pool_,
+                        ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
+    ~AstcBcPass();
+
+    /// Every layer of one level: `layers` layers of the block-linear ASTC data at `input` into
+    /// the level's BC blocks at `output`, `params.out_offset` words past its start. `kind` is the
+    /// bc_encoder.comp MODE_* the blocks take and `refine` whether the refined fit runs; both are
+    /// specialisation constants, so each pair is a pipeline of its own and the kinds a level does
+    /// not use are not in its shader.
+    void Run(const AstcBcPushConstants& params, u32 kind, bool refine, u32 layers, VkBuffer input,
+             VkDeviceSize input_offset, VkDeviceSize input_size, VkBuffer output,
+             VkDeviceSize output_offset, VkDeviceSize output_size);
+
+private:
+    /// The pipeline for a (kind, refine) pair, compiled on first use.
+    VkPipeline PipelineFor(u32 kind, bool refine);
+
+    Scheduler& scheduler;
+    ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    /// MODE_BC1 to MODE_BC1_OPAQUE with refine off, then the same with refine on. vk::Pipeline is
+    /// an owning handle: it destroys the pipeline when it dies, so these hold it, not the raw
+    /// VkPipeline.
+    std::array<std::optional<vk::Pipeline>, 10> pipelines;
 };
 
 class BlockLinearUnswizzle3DPass final : public ComputePass {

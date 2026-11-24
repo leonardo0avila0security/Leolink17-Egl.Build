@@ -14,11 +14,17 @@ set(FIDELITYFX_FILES
 set(GLSL_INCLUDES
     fidelityfx_fsr.frag
     ${FIDELITYFX_FILES}
+    # astc_bc.comp's bodies: the ASTC block decoder, the encode functions bc_encoder.comp shares,
+    # and the fused pass itself. Listed so an edit rebuilds the shaders that include them.
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_decode.glsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/bcn_encode.glsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.glsl
 )
 
 set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/astc_decoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_bc_copy.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/bc7_encoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_float.frag

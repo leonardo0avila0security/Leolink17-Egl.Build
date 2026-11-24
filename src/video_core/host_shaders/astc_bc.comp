@@ -1,0 +1,55 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+/* ASTC blocks straight into BC1/BC3 blocks, one dispatch, no RGBA8 image: the fused replacement
+   for astc_decoder.comp + bc_encoder.comp on the re-compression path (TranscodeAstcToBcn).
+   The body is astc_bc.glsl; this file only declares what it reads and writes. */
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform PushConstants {
+    uint width;            /* texels in a row of this level */
+    uint height;
+    uint blocks_x;         /* ASTC blocks in a row of this level */
+    uint blocks_y;
+    uint srgb;             /* nonzero: sRGB data, for void extents */
+    uint block_w;          /* the ASTC footprint */
+    uint block_h;
+    uint recip_w;          /* ceil(2^18 / block_w): v / block_w is (v * recip_w) >> 18 */
+    uint recip_h;
+    uint infill_ds;        /* the weight grid infill's steps, (1024 + block_w / 2) / (block_w - 1) */
+    uint infill_dt;
+    uint layer_stride;     /* block-linear: bytes between layers of this level */
+    uint block_size;
+    uint x_shift;
+    uint block_height;
+    uint block_height_mask;
+    uint native_tiling;    /* nonzero: Switch 2 GOBs, which swap offset bits 5 and 6 */
+    uint out_offset;       /* the level's first output word, in 8-byte units */
+};
+
+/* the ASTC blocks of this level, 16 bytes each, as they sit in the upload's staging buffer */
+layout (binding = 0, std430) readonly restrict buffer InputBlocks {
+    uvec4 astc_data[];
+};
+
+/* BC1 blocks are two words, BC3 four; a block's words in the encoder's order */
+layout (binding = 1, std430) writeonly restrict buffer OutputBlocks {
+    uvec2 out_blocks[];
+};
+
+#define block_dims uvec2(block_w, block_h)
+
+/* The block being decoded, in this invocation's registers, which is ScarletNX's slot out of
+   shared memory: DecodeBlock fills it, SlotTexel reads it, and slot 0 is the whole of it. */
+uint astc_block[39];
+#define TILE(field, slot) astc_block[(field) + (slot)]
+#define ASTC_SLOT 0u
+#define SNX_ASTC_NO_MAIN
+
+#include "astc_decode.glsl"
+#include "bcn_encode.glsl"
+#include "astc_bc.glsl"
