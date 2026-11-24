@@ -331,9 +331,11 @@ public:
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
     const bool ib_enable : 1 = true; ///< IB mode enabled
-    bool dma_increment_once : 1 = false;
-    bool signal_sync : 1 = false;
-    bool synced : 1 = false;
+    // Not bitfields: the fence thread sets synced, and a bitfield write would rewrite the byte it
+    // shares with dma_increment_once and signal_sync.
+    bool dma_increment_once = false;
+    bool signal_sync = false;
+    bool synced = false;
 };
 
 } // namespace Tegra
