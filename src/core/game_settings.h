@@ -9,6 +9,10 @@
 
 namespace VideoCore { class RendererBase; }
 
+namespace Settings {
+struct Values;
+}
+
 namespace Core::GameSettings {
 
 enum class OS {
@@ -44,7 +48,8 @@ enum class GPUVendor {
 };
 
 enum class TitleID : std::uint64_t {
-    NinjaGaidenRagebound = 0x0100781020710000ULL
+    NinjaGaidenRagebound = 0x0100781020710000ULL,
+    YoshiMysteriousBook = 0x0400245021D2C000ULL,
 };
 
 struct EnvironmentInfo {
@@ -54,6 +59,8 @@ struct EnvironmentInfo {
 };
 
 EnvironmentInfo DetectEnvironment(const VideoCore::RendererBase& renderer);
+
+void ApplyTitleDefaults(std::uint64_t program_id, Settings::Values& settings);
 
 void LoadOverrides(std::uint64_t program_id, const VideoCore::RendererBase& renderer);
 

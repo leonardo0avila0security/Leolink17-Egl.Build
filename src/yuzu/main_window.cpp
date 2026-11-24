@@ -17,6 +17,7 @@
 #include "common/game_presets.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "core/game_settings.h"
 #include "frontend_common/settings_generator.h"
 #include "render/performance_overlay.h"
 #ifdef HAS_RESHADE
@@ -4487,6 +4488,10 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
 
     if (result != QDialog::Accepted && !UISettings::values.configuration_applied) {
         Settings::RestoreGlobalState(QtCommon::system->IsPoweredOn());
+        if (QtCommon::system->IsPoweredOn()) {
+            Core::GameSettings::ApplyTitleDefaults(
+                QtCommon::system->GetApplicationProcessProgramID(), Settings::values);
+        }
         return;
     } else if (result == QDialog::Accepted) {
         dialog.ApplyConfiguration();
@@ -4499,6 +4504,10 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
 
     // Do not cause the global config to write local settings into the config file
     const bool is_powered_on = QtCommon::system->IsPoweredOn();
+    if (is_powered_on) {
+        Core::GameSettings::ApplyTitleDefaults(QtCommon::system->GetApplicationProcessProgramID(),
+                                               Settings::values);
+    }
     Settings::RestoreGlobalState(is_powered_on);
     QtCommon::system->HIDCore().ReloadInputDevices();
 

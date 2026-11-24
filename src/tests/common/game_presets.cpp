@@ -17,6 +17,7 @@
 #include "common/game_presets.h"
 #include "common/settings.h"
 #include "common/thread.h"
+#include "core/game_settings.h"
 
 namespace {
 void SetConflictingPreferences(Settings::Values& settings, bool per_game) {
@@ -269,4 +270,22 @@ TEST_CASE("Game tweaks refer to valid per-game settings", "[game_presets]") {
     }
     CHECK_FALSE(Settings::IsGameTweak("resolution_setup"));
     CHECK(Settings::FindGameTweaks(0) == nullptr);
+}
+
+TEST_CASE("Yoshi defaults to reactive flushing and respects a per-game value", "[game_presets]") {
+    auto settings = std::make_unique<Settings::Values>();
+    auto& reactive_flushing = settings->use_reactive_flushing;
+    constexpr u64 yoshi = static_cast<u64>(Core::GameSettings::TitleID::YoshiMysteriousBook);
+    reactive_flushing.SetGlobal(true);
+    reactive_flushing.SetValue(false);
+
+    Core::GameSettings::ApplyTitleDefaults(Settings::DonkeyKongBananzaProgramId, *settings);
+    CHECK_FALSE(reactive_flushing.GetValue());
+    Core::GameSettings::ApplyTitleDefaults(yoshi, *settings);
+    CHECK(reactive_flushing.GetValue());
+    CHECK_FALSE(reactive_flushing.GetValue(true));
+
+    reactive_flushing.SetValue(false);
+    Core::GameSettings::ApplyTitleDefaults(yoshi, *settings);
+    CHECK_FALSE(reactive_flushing.GetValue());
 }

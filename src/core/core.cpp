@@ -440,6 +440,7 @@ struct System::Impl {
 
         // Expose program id to dump sites and other global readers.
         Settings::SetCurrentProgramID(params.program_id);
+        GameSettings::ApplyTitleDefaults(params.program_id, Settings::values);
 
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);

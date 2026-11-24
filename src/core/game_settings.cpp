@@ -119,6 +119,15 @@ EnvironmentInfo DetectEnvironment(const VideoCore::RendererBase& renderer) {
     return env;
 }
 
+void ApplyTitleDefaults(std::uint64_t program_id, Settings::Values& settings) {
+    auto& reactive_flushing = settings.use_reactive_flushing;
+    if (program_id == static_cast<std::uint64_t>(TitleID::YoshiMysteriousBook) &&
+        reactive_flushing.UsingGlobal()) {
+        reactive_flushing.SetGlobal(false);
+        reactive_flushing.SetValue(true);
+    }
+}
+
 void LoadOverrides(std::uint64_t program_id, const VideoCore::RendererBase& renderer) {
     const auto env = DetectEnvironment(renderer);
 
