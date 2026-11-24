@@ -6,8 +6,11 @@
 
 #include <array>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <set>
+#include <string_view>
+#include <utility>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -53,7 +56,6 @@ std::optional<NvdecCommon::VideoCodec> CodecFromMime(std::string_view mime) {
 
 bool IsH264Stream(std::span<const u8> data) {
     if (data.size() >= 4) {
-        // Annex-B 3-byte start code: 00 00 01 <nal_header>
         if (data[0] == 0 && data[1] == 0 && data[2] == 1) {
             const u8 nal_type = data[3] & 0x1F;
             if ((data[3] & 0x80) == 0 && nal_type >= 1 && nal_type <= 23) {
@@ -62,14 +64,12 @@ bool IsH264Stream(std::span<const u8> data) {
         }
     }
     if (data.size() >= 5) {
-        // Annex-B 4-byte start code: 00 00 00 01 <nal_header>
         if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) {
             const u8 nal_type = data[4] & 0x1F;
             if ((data[4] & 0x80) == 0 && nal_type >= 1 && nal_type <= 23) {
                 return true;
             }
         }
-        // avcC / MP4 length-prefixed NAL unit: [u32 be length] <nal_header>
         const u32 nalu_len = (static_cast<u32>(data[0]) << 24) |
                              (static_cast<u32>(data[1]) << 16) |
                              (static_cast<u32>(data[2]) << 8) |
@@ -82,7 +82,6 @@ bool IsH264Stream(std::span<const u8> data) {
         }
     }
     if (data.size() >= 7) {
-        // avcC configuration record: version=1, profile, compat, level, lengthSizeMinusOne | 0xFC, numSPS | 0xE0
         if (data[0] == 1 && (data[4] & 0xFC) == 0xFC && (data[5] & 0xE0) == 0xE0 && (data[5] & 0x1F) > 0) {
             return true;
         }
@@ -91,16 +90,23 @@ bool IsH264Stream(std::span<const u8> data) {
 }
 
 struct Nx2VideoDecoder::Impl {
+    explicit Impl(CodecBackend backend_) : backend{std::move(backend_)} {}
+
+    const CodecBackend backend;
     std::string name;
     std::optional<FFmpeg::Decoder> decoder;
     std::optional<FFmpeg::HardwareContext> hardware;
-    std::optional<FFmpeg::DecoderContext> context;
+    std::unique_ptr<FFmpeg::DecoderContext> context;
     SwsContext* scaler{};
     bool open{};
+    bool on_gpu{};
+    bool received{};
     H264PacketConverter h264_packets;
-    /// Timestamps of submitted frames not yet output. Frames copied back from a host GPU decoder
-    /// lose theirs and take the earliest one instead.
+    /// FFmpeg normally propagates pts. Some hardware decoders lose theirs, so use the earliest
+    /// pending timestamp in that case.
     std::multiset<u64> pending_pts;
+    std::vector<std::pair<std::vector<u8>, u64>> gpu_packets;
+    bool gpu_packets_lost{};
     std::vector<u8> packet; ///< FFmpeg reads up to AV_INPUT_BUFFER_PADDING_SIZE past the data
 
     ~Impl() {
@@ -109,8 +115,84 @@ struct Nx2VideoDecoder::Impl {
         hardware.reset();
     }
 
-    void Receive(std::vector<Nx2Picture>& pictures) {
-        while (auto frame = context->ReceiveFrame()) {
+    bool OpenGpu() {
+        context = std::make_unique<FFmpeg::DecoderContext>(*decoder);
+        hardware.emplace();
+        on_gpu = backend.initialize_hardware(*hardware, *context, *decoder);
+        return backend.open(*context, *decoder, on_gpu);
+    }
+
+    std::unique_ptr<FFmpeg::DecoderContext> OpenCpu() const {
+        auto cpu = std::make_unique<FFmpeg::DecoderContext>(*decoder);
+        if (!backend.open(*cpu, *decoder, false)) {
+            return {};
+        }
+        return cpu;
+    }
+
+    void UseCpu(std::unique_ptr<FFmpeg::DecoderContext> cpu) {
+        context = std::move(cpu);
+        hardware.reset();
+        on_gpu = false;
+    }
+
+    static bool Rejected(int ret) {
+        return ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN);
+    }
+
+    int Send(const AVPacket* av_packet) const {
+        const int ret = backend.send(*context, av_packet, on_gpu);
+        if (Rejected(ret)) {
+            LOG_ERROR(HW_GPU, "nx2 video: avcodec_send_packet error {}", ret);
+        }
+        return ret;
+    }
+
+    bool Replay(const AVPacket* unsent_packet, bool drain, std::vector<Nx2Picture>& pictures) {
+        for (const auto& [data, pts] : gpu_packets) {
+            FFmpeg::Packet replay{
+                std::span<const u8>{data.data(), data.size() - AV_INPUT_BUFFER_PADDING_SIZE}};
+            replay.GetPacket()->pts = static_cast<s64>(pts);
+            pending_pts.insert(pts);
+            if (Send(replay.GetPacket()) != 0 || !Receive(pictures)) {
+                return false;
+            }
+        }
+        if (unsent_packet) {
+            pending_pts.insert(static_cast<u64>(unsent_packet->pts));
+            return Send(unsent_packet) == 0 && Receive(pictures);
+        }
+        return !drain || (!Rejected(Send(nullptr)) && Receive(pictures));
+    }
+
+    void FallBackToCpu(const AVPacket* unsent_packet, bool drain, std::vector<Nx2Picture>& pictures) {
+        auto cpu = gpu_packets_lost ? nullptr : OpenCpu();
+        if (!cpu) {
+            return;
+        }
+        auto gpu = std::exchange(context, std::move(cpu));
+        auto gpu_pts = std::exchange(pending_pts, {});
+        const size_t count = pictures.size();
+        on_gpu = false;
+        if (Replay(unsent_packet, drain, pictures)) {
+            LOG_WARNING(HW_GPU, "nx2 video: host GPU decoder rejected the stream, decoding on the CPU");
+            gpu.reset();
+            UseCpu(std::move(context));
+            return;
+        }
+        context = std::move(gpu);
+        on_gpu = true;
+        pending_pts = std::move(gpu_pts);
+        pictures.resize(count);
+        received = false;
+    }
+
+    bool Receive(std::vector<Nx2Picture>& pictures) {
+        while (true) {
+            auto [frame, failed] = backend.receive(*context, on_gpu);
+            if (!frame) {
+                return !failed;
+            }
             const AVFrame* f = frame->GetFrame();
             const s64 stamp = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp
                                                                          : f->pts;
@@ -126,11 +208,28 @@ struct Nx2VideoDecoder::Impl {
             }
             pictures.push_back({static_cast<u32>(f->width), static_cast<u32>(f->height), pts,
                                 std::move(frame)});
+            received = true;
         }
     }
 };
 
-Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<Impl>()} {
+Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime)
+    : Nx2VideoDecoder{mime, {
+          .initialize_hardware = [](auto& hardware, auto& context, const auto& decoder) {
+              return hardware.InitializeForDecoder(context, decoder);
+          },
+          .open = [](auto& context, const auto& decoder, bool) { return context.OpenContext(decoder); },
+          .send = [](auto& context, const AVPacket* packet, bool) {
+              return avcodec_send_packet(context.GetCodecContext(), packet);
+          },
+          .receive = [](auto& context, bool) {
+              auto frame = context.ReceiveFrame();
+              return ReceiveResult{std::move(frame), context.ReceiveFailed()};
+          },
+      }} {}
+
+Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime, CodecBackend backend)
+    : impl{std::make_unique<Impl>(std::move(backend))} {
     impl->name = std::string{mime};
     const auto codec = CodecFromMime(mime);
     if (!codec) {
@@ -142,12 +241,16 @@ Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<
         LOG_ERROR(HW_GPU, "nx2 video: FFmpeg has no decoder for \"{}\"", mime);
         return;
     }
-    impl->context.emplace(*impl->decoder);
     if (Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
-        impl->hardware.emplace();
-        impl->hardware->InitializeForDecoder(*impl->context, *impl->decoder);
+        impl->open = impl->OpenGpu();
     }
-    impl->open = impl->context->OpenContext(*impl->decoder);
+    if (!impl->open) {
+        if (impl->on_gpu) {
+            LOG_WARNING(HW_GPU, "nx2 video: host GPU decoder failed to open, decoding on the CPU");
+        }
+        impl->UseCpu(impl->OpenCpu());
+        impl->open = impl->context != nullptr;
+    }
     LOG_INFO(HW_GPU, "nx2 video: decoder for \"{}\" {}", mime, impl->open ? "open" : "failed to open");
 }
 
@@ -175,21 +278,39 @@ void Nx2VideoDecoder::Decode(std::span<const u8> data, u64 pts, std::vector<Nx2P
 
     FFmpeg::Packet packet{std::span<const u8>{impl->packet.data(), data.size()}};
     packet.GetPacket()->pts = static_cast<s64>(pts);
-    // Hidden VP9 frames never come out: keep the set from growing over a long movie.
-    if (impl->pending_pts.size() >= 64) {
-        impl->pending_pts.erase(impl->pending_pts.begin());
+    const bool waiting = impl->on_gpu && !impl->received;
+    const int ret = impl->Send(packet.GetPacket());
+    if (ret == 0) {
+        // Hidden VP9 frames never come out: keep the set from growing over a long movie.
+        if (impl->pending_pts.size() >= 64) {
+            impl->pending_pts.erase(impl->pending_pts.begin());
+        }
+        impl->pending_pts.insert(pts);
+        if (waiting && impl->gpu_packets.size() == 64) {
+            impl->gpu_packets.clear();
+            impl->gpu_packets_lost = true;
+        } else if (waiting && !impl->gpu_packets_lost) {
+            impl->gpu_packets.emplace_back(impl->packet, pts);
+        }
     }
-    impl->pending_pts.insert(pts);
-    impl->context->SendPacket(packet);
-    impl->Receive(pictures);
+    const bool receive_ok = impl->Receive(pictures);
+    if (impl->on_gpu && !impl->received && (Impl::Rejected(ret) || !receive_ok)) {
+        impl->FallBackToCpu(ret == 0 ? nullptr : packet.GetPacket(), false, pictures);
+    }
+    if (impl->received || !impl->on_gpu) {
+        impl->gpu_packets.clear();
+    }
 }
 
 void Nx2VideoDecoder::Drain(std::vector<Nx2Picture>& pictures) {
     if (!impl->open) {
         return;
     }
-    avcodec_send_packet(impl->context->GetCodecContext(), nullptr);
-    impl->Receive(pictures);
+    const int ret = impl->Send(nullptr);
+    const bool receive_ok = impl->Receive(pictures);
+    if (impl->on_gpu && !impl->received && (Impl::Rejected(ret) || !receive_ok)) {
+        impl->FallBackToCpu(nullptr, true, pictures);
+    }
     Reset();
 }
 
@@ -198,6 +319,9 @@ void Nx2VideoDecoder::Reset() {
         avcodec_flush_buffers(impl->context->GetCodecContext());
     }
     impl->pending_pts.clear();
+    impl->gpu_packets.clear();
+    impl->gpu_packets_lost = false;
+    impl->received = false;
 }
 
 void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width,

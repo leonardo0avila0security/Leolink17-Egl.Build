@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -14,8 +15,13 @@
 
 #include "common/common_types.h"
 
+struct AVPacket;
+
 namespace FFmpeg {
+class Decoder;
+class DecoderContext;
 class Frame;
+class HardwareContext;
 }
 
 namespace Tegra::Host1x {
@@ -28,14 +34,12 @@ struct Nx2Picture {
     std::shared_ptr<FFmpeg::Frame> frame;
 };
 
-/// Pixel layouts of a Switch 2 decoder output image.
 enum class Nx2PictureFormat : u32 {
-    Nv12,  ///< Luma rows, then interleaved Cb/Cr rows at chroma_offset
+    Nv12,
     Rgba8,
     Bgra8,
 };
 
-/// Checks if stream data begins with an H.264 Annex-B start code or avcC/MP4 length-prefixed NALUs.
 bool IsH264Stream(std::span<const u8> data);
 
 /// The decoder behind the Switch 2 video decoder service (nn::codec::video): FFmpeg decodes the
@@ -51,21 +55,33 @@ public:
 
     const std::string& Name() const;
 
-    /// Decodes one compressed frame and appends the pictures it completes.
     void Decode(std::span<const u8> data, u64 pts, std::vector<Nx2Picture>& pictures);
 
-    /// End of stream: appends the pictures the decoder still holds, then starts over.
     void Drain(std::vector<Nx2Picture>& pictures);
 
-    /// Drops everything queued in the decoder (the game flushed it to seek).
     void Reset();
 
-    /// Converts a picture to `format` in `out`: rows `pitch` bytes apart, NV12's chroma plane at
-    /// `chroma_offset`, scaled to width x height.
     void Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width, u32 height,
                 u64 pitch, u64 chroma_offset, std::span<u8> out);
 
 private:
+    friend class Nx2VideoDecoderTestAccess;
+
+    struct ReceiveResult {
+        std::shared_ptr<FFmpeg::Frame> frame;
+        bool failed{};
+    };
+
+    struct CodecBackend {
+        std::function<bool(FFmpeg::HardwareContext&, FFmpeg::DecoderContext&,
+                           const FFmpeg::Decoder&)> initialize_hardware;
+        std::function<bool(FFmpeg::DecoderContext&, const FFmpeg::Decoder&, bool)> open;
+        std::function<int(FFmpeg::DecoderContext&, const AVPacket*, bool)> send;
+        std::function<ReceiveResult(FFmpeg::DecoderContext&, bool)> receive;
+    };
+
+    Nx2VideoDecoder(std::string_view mime, CodecBackend backend);
+
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

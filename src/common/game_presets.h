@@ -21,6 +21,8 @@ inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
 inline constexpr u64 HyruleWarriorsProgramId = 0x04003F40232DE000ULL;
 inline constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
 
+inline constexpr u64 YoshiProgramId = 0x0400245021D2C000ULL;
+
 struct RecommendedSetting {
     std::string key;
     std::string value;
@@ -98,6 +100,7 @@ inline const std::map<u64, GamePreset> game_presets{
 inline const std::map<u64, std::vector<std::string>> game_tweaks{
     {MarioKartWorldProgramId, {"mkw_30fps", "mkw_dynamic_fps"}},
     {HyruleWarriorsProgramId, {"hyrule_dynamic_fps", "hyrule_30fps"}},
+    {YoshiProgramId, {"yoshi_sync_movie_submits"}},
 };
 
 inline const std::vector<std::string>* FindGameTweaks(u64 program_id) {

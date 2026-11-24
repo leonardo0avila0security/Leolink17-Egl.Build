@@ -94,9 +94,6 @@
 
 namespace Service {
 
-/// LOCAL TEST (Zelda): steady-clock time of the last decoded video frame (PaceToVblank).
-inline std::atomic<s64> g_nx2_video_last_frame_ns{0};
-
 // Creates a session served by `iface` and returns its client end. Unlike PushIpcInterface this
 // works from a domain too, for callers that want a raw session handle.
 template <class T>
@@ -2214,14 +2211,7 @@ private:
         }
         // LOCAL TEST (Zelda): not while a video plays. Ocarina's cutscene videos are 60 fps AV1;
         // forced to two vblanks a frame they played at half rate.
-        const s64 video_ns = g_nx2_video_last_frame_ns.load(std::memory_order_relaxed);
-        const bool video_playing =
-            video_ns != 0 &&
-            std::chrono::steady_clock::now().time_since_epoch().count() - video_ns <
-                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                    std::chrono::milliseconds{500})
-                    .count();
-        if (forced_interval != 0 && !video_playing) {
+        if (forced_interval != 0 && !system.GPU().IsNx2VideoPlaying()) {
             swap_interval = forced_interval;
         }
         return swap_interval;
@@ -3578,9 +3568,7 @@ private:
                 decoder->Drain(pictures);
             }
             if (!pictures.empty()) {
-                g_nx2_video_last_frame_ns.store(
-                    std::chrono::steady_clock::now().time_since_epoch().count(),
-                    std::memory_order_relaxed);
+                system.GPU().RecordNx2VideoFrame();
             }
             lk.lock();
             if (m_flush) {

@@ -339,7 +339,8 @@ bool DecoderContext::SendPacket(const Packet& packet) {
 std::shared_ptr<Frame> DecoderContext::ReceiveFrame() {
     auto ReceiveImpl = [&](AVFrame* frame) -> int {
         const int ret = avcodec_receive_frame(m_codec_context, frame);
-        if (ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
+        m_receive_failed = ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN);
+        if (m_receive_failed) {
             LOG_ERROR(HW_GPU, "avcodec_receive_frame error: {}", AVError(ret));
         }
         return ret;
@@ -354,6 +355,7 @@ std::shared_ptr<Frame> DecoderContext::ReceiveFrame() {
     if (m_codec_context->hw_device_ctx) {
         m_final_frame->SetFormat(PreferredGpuFormat);
         if (const int ret = av_hwframe_transfer_data(m_final_frame->GetFrame(), intermediate_frame->GetFrame(), 0); ret < 0) {
+            m_receive_failed = true;
             LOG_ERROR(HW_GPU, "av_hwframe_transfer_data error: {}", AVError(ret));
             return {};
         }

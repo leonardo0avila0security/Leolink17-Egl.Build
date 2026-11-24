@@ -381,6 +381,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, hyrule_30fps, tr("Hyrule Warriors: Age of Imprisonment: 30 FPS mode"),
            tr("Always runs at 30 FPS with the game's split-screen time step, at normal game speed. "
               "Takes precedence over dynamic FPS."));
+    INSERT(Settings, yoshi_sync_movie_submits, tr("Yoshi: Synchronize GPU submissions during movies"),
+           tr("Prevents a green title movie when asynchronous GPU emulation is enabled."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),

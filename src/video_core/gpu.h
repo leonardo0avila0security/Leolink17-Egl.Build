@@ -235,6 +235,9 @@ public:
 
     void RendererFrameEndNotify();
 
+    void RecordNx2VideoFrame();
+    [[nodiscard]] bool IsNx2VideoPlaying() const;
+
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
                           std::vector<Service::Nvidia::NvFence>&& fences);
 
