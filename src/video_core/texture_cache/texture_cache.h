@@ -33,6 +33,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/texture_cache/eviction_age.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/memory_budget.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -183,14 +184,16 @@ void TextureCache<P>::RunGarbageCollector() {
         high_priority_mode = total_used_memory >= expected_memory;
         aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
         const u64 idle_age = native_thresholds_applied ? NativeTextureCacheIdleAge() : u64{50};
-        ticks_to_destroy =
+        const u64 mode_age =
             TextureCacheCollectionAge(high_priority_mode, aggressive_mode, idle_age);
-        // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
+        // EDEN_NX2_TC_MIN_AGE=<frames>: keep images used more recently while there is room
+        // (thrash tests).
         static const u64 min_age = [] {
             const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
             return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
         }();
-        ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
+        ticks_to_destroy =
+            EvictionAge(mode_age, min_age, total_used_memory, retention_limit, false);
         static constexpr size_t normal_iterations = 10;
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : normal_iterations);
     };
@@ -434,6 +437,7 @@ void TextureCache<P>::TickFrame() {
             }
             if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
+                retention_limit = 0;
                 if (budget > 2_GiB || (budget != 0 && NativeTextureCacheBudgetEnabled())) {
                     native_heap_budget = budget;
                     const u64 old_critical = critical_memory;
@@ -454,6 +458,9 @@ void TextureCache<P>::TickFrame() {
                     critical_memory =
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
+                    const u64 room_margin =
+                        (std::min)(pressure_margin + slack_margin, budget / 2);
+                    retention_limit = budget - room_margin;
                     ApplyThresholdOverrides(false);
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared after the clamp: with a budget past MaxCriticalMemory

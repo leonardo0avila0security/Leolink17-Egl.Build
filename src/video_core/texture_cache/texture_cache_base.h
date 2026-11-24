@@ -656,6 +656,7 @@ private:
     u64 minimum_memory;
     u64 expected_memory;
     u64 critical_memory;
+    u64 retention_limit = 0;
     u64 native_heap_budget{};
     size_t gpu_unswizzle_maxsize = 0;
     size_t swizzle_chunk_size = 0;
