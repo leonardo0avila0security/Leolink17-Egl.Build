@@ -278,7 +278,7 @@ private:
         Mapped = 2,
     };
 
-    std::vector<u64> entries;
+    Common::SparseLargeVector<u64> entries;
     std::vector<u64> big_entries;
 
     GPUVAddr PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, EntryType entry_type);

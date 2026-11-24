@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <cstdlib>
 #include <utility>
@@ -178,9 +179,13 @@ public:
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
         current_gpu_addr = gpu_addr;
         current_limit = limit;
-        // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
-        // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
-        const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
+        // Preserve 32-bit wrap for near-UINT32_MAX sentinel limits (clamped to 1 slot),
+        // and grow geometrically by powers of two from 4096 entries instead of 512K (~16 MiB).
+        const bool wrapped = static_cast<u32>(limit + 0x80000U) < limit;
+        const size_t min_descriptors = wrapped ? size_t{1} : static_cast<size_t>(limit) + 1;
+        const size_t rounded =
+            wrapped ? size_t{1} : std::bit_ceil((std::max)(min_descriptors, size_t{0x1000}));
+        const size_t num_descriptors = (std::max)(descriptors.size(), rounded);
         read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
         ClearReadDescriptors();
         invalidated = false;

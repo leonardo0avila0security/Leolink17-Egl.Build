@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include <boost/container/static_vector.hpp>
 
@@ -115,6 +116,74 @@ private:
 };
 
 struct IPlatformServiceManager::Impl {
+    void EnsureFontsLoaded(Core::System& system) {
+        std::call_once(fonts_once, [&] {
+            shared_font.resize(SHARED_FONT_MEM_SIZE);
+
+            auto& fsc = system.GetFileSystemController();
+
+            // Attempt to load shared font data from disk
+            const auto* nand = fsc.GetSystemNANDContents();
+            std::size_t offset = 0;
+            // Each font type's region, empty when the font could not be loaded.
+            std::array<FontRegion, SHARED_FONTS.size()> type_regions{};
+            // Rebuild shared fonts from data ncas or synthesize
+            for (size_t font_index = 0; font_index < SHARED_FONTS.size(); ++font_index) {
+                const auto& font = SHARED_FONTS[font_index];
+                FileSys::VirtualFile romfs;
+                const auto nca = nand->GetEntry(static_cast<u64>(font.first),
+                                                FileSys::ContentRecordType::Data);
+                if (nca) {
+                    romfs = nca->GetRomFS();
+                }
+
+                if (!romfs) {
+                    romfs = FileSys::SystemArchive::SynthesizeSystemArchive(
+                        static_cast<u64>(font.first));
+                }
+
+                if (!romfs) {
+                    LOG_ERROR(Service_NS, "Failed to find or synthesize {:016X}! Skipping",
+                              font.first);
+                    continue;
+                }
+
+                const auto extracted_romfs = FileSys::ExtractRomFS(romfs);
+                if (!extracted_romfs) {
+                    LOG_ERROR(Service_NS, "Failed to extract RomFS for {:016X}! Skipping",
+                              font.first);
+                    continue;
+                }
+                const auto font_fp = extracted_romfs->GetFile(font.second);
+                if (!font_fp) {
+                    LOG_ERROR(Service_NS, "{:016X} has no file \"{}\"! Skipping", font.first,
+                              font.second);
+                    continue;
+                }
+                std::vector<u32> font_data_u32(font_fp->GetSize() / sizeof(u32));
+                font_fp->ReadBytes<u32>(font_data_u32.data(), font_fp->GetSize());
+                // We need to be BigEndian as u32s for the xor encryption
+                std::transform(font_data_u32.begin(), font_data_u32.end(), font_data_u32.begin(),
+                               Common::swap32);
+                // Font offset and size do not account for the header
+                const FontRegion region{u32(offset + 8),
+                                        u32((font_data_u32.size() * sizeof(u32)) - 8)};
+                DecryptSharedFont(font_data_u32, shared_font, offset);
+                shared_font_regions.push_back(region);
+                type_regions[font_index] = region;
+            }
+
+            // The data after each BFTTF header is the plain font: GetBuiltInFontSharedMemory copies it.
+            u32 builtin_offset = 0;
+            for (const auto& region : type_regions) {
+                builtin_font_sources.push_back(region.offset);
+                builtin_font_regions.push_back({builtin_offset, region.size});
+                builtin_offset = Common::AlignUp(builtin_offset + region.size, 0x1000);
+            }
+            builtin_font_memory_size = std::max<u32>(builtin_offset, 0x1000);
+        });
+    }
+
     const FontRegion& GetSharedFontRegion(std::size_t index) const {
         return index < shared_font_regions.size() ? shared_font_regions[index] : EMPTY_REGION;
     }
@@ -129,8 +198,9 @@ struct IPlatformServiceManager::Impl {
     u32 builtin_font_memory_size{};
     /// Made by the first GetBuiltInFontSharedMemory (Switch 2 titles only).
     Kernel::KSharedMemory* builtin_font_memory{};
-    /// Backing memory for the shared font data
-    std::array<u8, SHARED_FONT_MEM_SIZE> shared_font;
+    /// Backing memory for the shared font data (loaded on first font request).
+    std::vector<u8> shared_font;
+    std::once_flag fonts_once;
 };
 
 IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const char* service_name_)
@@ -159,67 +229,11 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
     };
     // clang-format on
     RegisterHandlers(functions);
-
-    auto& fsc = system.GetFileSystemController();
-
-    // Attempt to load shared font data from disk
-    const auto* nand = fsc.GetSystemNANDContents();
-    std::size_t offset = 0;
-    // Each font type's region, empty when the font could not be loaded.
-    std::array<FontRegion, SHARED_FONTS.size()> type_regions{};
-    // Rebuild shared fonts from data ncas or synthesize
-    for (size_t font_index = 0; font_index < SHARED_FONTS.size(); ++font_index) {
-        const auto& font = SHARED_FONTS[font_index];
-        FileSys::VirtualFile romfs;
-        const auto nca =
-            nand->GetEntry(static_cast<u64>(font.first), FileSys::ContentRecordType::Data);
-        if (nca) {
-            romfs = nca->GetRomFS();
-        }
-
-        if (!romfs) {
-            romfs = FileSys::SystemArchive::SynthesizeSystemArchive(static_cast<u64>(font.first));
-        }
-
-        if (!romfs) {
-            LOG_ERROR(Service_NS, "Failed to find or synthesize {:016X}! Skipping", font.first);
-            continue;
-        }
-
-        const auto extracted_romfs = FileSys::ExtractRomFS(romfs);
-        if (!extracted_romfs) {
-            LOG_ERROR(Service_NS, "Failed to extract RomFS for {:016X}! Skipping", font.first);
-            continue;
-        }
-        const auto font_fp = extracted_romfs->GetFile(font.second);
-        if (!font_fp) {
-            LOG_ERROR(Service_NS, "{:016X} has no file \"{}\"! Skipping", font.first, font.second);
-            continue;
-        }
-        std::vector<u32> font_data_u32(font_fp->GetSize() / sizeof(u32));
-        font_fp->ReadBytes<u32>(font_data_u32.data(), font_fp->GetSize());
-        // We need to be BigEndian as u32s for the xor encryption
-        std::transform(font_data_u32.begin(), font_data_u32.end(), font_data_u32.begin(),
-                       Common::swap32);
-        // Font offset and size do not account for the header
-        const FontRegion region{u32(offset + 8), u32((font_data_u32.size() * sizeof(u32)) - 8)};
-        DecryptSharedFont(font_data_u32, impl->shared_font, offset);
-        impl->shared_font_regions.push_back(region);
-        type_regions[font_index] = region;
-    }
-
-    // The data after each BFTTF header is the plain font: GetBuiltInFontSharedMemory copies it.
-    u32 builtin_offset = 0;
-    for (const auto& region : type_regions) {
-        impl->builtin_font_sources.push_back(region.offset);
-        impl->builtin_font_regions.push_back({builtin_offset, region.size});
-        builtin_offset = Common::AlignUp(builtin_offset + region.size, 0x1000);
-    }
-    impl->builtin_font_memory_size = std::max<u32>(builtin_offset, 0x1000);
 }
 
 // The Nx font SDK supplies transfer memory and expects an interface whose offsets refer to it.
 void IPlatformServiceManager::RequestLoadNxFont(HLERequestContext& ctx) {
+    impl->EnsureFontsLoaded(system);
     IPC::RequestParser rp{ctx};
     const u32 flags = rp.Pop<u32>();
     const u32 requested_size = rp.Pop<u32>();
@@ -258,6 +272,7 @@ void IPlatformServiceManager::RequestLoadNxFont(HLERequestContext& ctx) {
 // Switch 2: the shared memory GetBuiltInFontData offsets point into (copy handle, u32 size); the
 // SDK maps it read-only. It holds plain copies of the fonts, apart from the Switch 1 font memory.
 void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx) {
+    impl->EnsureFontsLoaded(system);
     LOG_WARNING(Service_NS, "(STUBBED) Switch 2 GetBuiltInFontSharedMemory, {:#x} bytes",
                 impl->builtin_font_memory_size);
     if (impl->builtin_font_memory == nullptr) {
@@ -296,6 +311,7 @@ void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx)
 // data there. The types are the SharedFontType values: the SDK's GetSharedFontAddress and
 // GetSharedFontSize pass their type through unchanged.
 void IPlatformServiceManager::GetBuiltInFontData(HLERequestContext& ctx) {
+    impl->EnsureFontsLoaded(system);
     // The SDK packs the type in the first byte and the bool in the second; the two bytes after them
     // are padding, left as whatever was on the caller's stack.
     IPC::RequestParser rp{ctx};
@@ -337,6 +353,7 @@ Result IPlatformServiceManager::GetLoadState(Out<LoadState> out_load_state, Shar
 }
 
 Result IPlatformServiceManager::GetSize(Out<u32> out_size, SharedFontType type) {
+    impl->EnsureFontsLoaded(system);
     LOG_DEBUG(Service_NS, "called, shared_font_type={}", type);
     *out_size = impl->GetSharedFontRegion(static_cast<size_t>(type)).size;
     R_SUCCEED();
@@ -344,6 +361,7 @@ Result IPlatformServiceManager::GetSize(Out<u32> out_size, SharedFontType type) 
 
 Result IPlatformServiceManager::GetSharedMemoryAddressOffset(Out<u32> out_shared_memory_offset,
                                                              SharedFontType type) {
+    impl->EnsureFontsLoaded(system);
     LOG_DEBUG(Service_NS, "called, shared_font_type={}", type);
     *out_shared_memory_offset = impl->GetSharedFontRegion(static_cast<size_t>(type)).offset;
     R_SUCCEED();
@@ -352,6 +370,7 @@ Result IPlatformServiceManager::GetSharedMemoryAddressOffset(Out<u32> out_shared
 Result IPlatformServiceManager::GetSharedMemoryNativeHandle(OutCopyHandle<Kernel::KSharedMemory> out_shared_memory_native_handle) {
     // Map backing memory for the font data
     LOG_DEBUG(Service_NS, "called");
+    impl->EnsureFontsLoaded(system);
 
     // Create shared font memory object
     std::memcpy(kernel.GetFontSharedMem().GetPointer(), impl->shared_font.data(), impl->shared_font.size());
@@ -366,6 +385,7 @@ Result IPlatformServiceManager::GetSharedFontInOrderOfPriority(
     OutArray<u32, BufferAttr_HipcMapAlias> out_font_offsets,
     OutArray<u32, BufferAttr_HipcMapAlias> out_font_sizes, Out<bool> out_fonts_are_loaded,
     Out<u32> out_font_count, Set::LanguageCode language_code) {
+    impl->EnsureFontsLoaded(system);
     LOG_DEBUG(Service_NS, "called, language_code={:#x}", language_code);
 
     // The maximum number of elements that can be returned is 6. Regardless of the available fonts

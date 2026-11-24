@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdlib>
 #include <memory>
+#include <type_traits>
 #include <variant>
 #include <vector>
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -22,14 +23,14 @@ class Device;
 class Scheduler;
 
 struct DescriptorAddress {
-    VkDeviceAddress address{};
-    VkDeviceSize range{};
-    VkFormat format{};
-    u32 pad{};
+    VkDeviceAddress address;
+    VkDeviceSize range;
+    VkFormat format;
+    u32 pad;
 };
 
 union DescriptorUpdateEntry {
-    DescriptorUpdateEntry() : raw{} {}
+    DescriptorUpdateEntry() = default;
     DescriptorUpdateEntry(VkDescriptorImageInfo image_) : raw{} {
         image.sampler = image_.sampler;
         image.imageView = image_.imageView;
@@ -40,13 +41,14 @@ union DescriptorUpdateEntry {
         texel_buffer = texel_buffer_;
     }
     DescriptorUpdateEntry(DescriptorAddress address_) : address{address_} {}
-    std::array<u64, 3> raw{};
+    std::array<u64, 3> raw;
     VkDescriptorImageInfo image;
     VkDescriptorBufferInfo buffer;
     VkBufferView texel_buffer;
     DescriptorAddress address;
 };
 static_assert(sizeof(DescriptorUpdateEntry) == 24);
+static_assert(std::is_trivially_default_constructible_v<DescriptorUpdateEntry>);
 
 class UpdateDescriptorQueue final {
     // This should be plenty for the vast majority of cases. Most desktop platforms only
@@ -109,6 +111,7 @@ public:
             .address = base_address == 0 ? 0 : base_address + offset,
             .range = base_address == 0 ? VK_WHOLE_SIZE : size,
             .format = VK_FORMAT_UNDEFINED,
+            .pad = 0,
         };
     }
 
@@ -126,6 +129,7 @@ public:
             .address = base_address == 0 ? 0 : base_address + offset,
             .range = base_address == 0 ? VK_WHOLE_SIZE : size,
             .format = format,
+            .pad = 0,
         };
     }
 

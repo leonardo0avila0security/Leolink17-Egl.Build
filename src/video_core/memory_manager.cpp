@@ -63,7 +63,7 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     big_page_table_dev.ResizeAndClear(big_page_table_size);
     big_entries.resize(big_page_table_size / 32, 0);
     big_page_continuous.resize(big_page_table_size / continuous_bits, 0);
-    entries.resize(page_table_size / 32, 0);
+    entries.ResizeAndClear(page_table_size / 32);
 }
 
 MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_,
@@ -100,10 +100,14 @@ void MemoryManager::SetEntry(size_t position, MemoryManager::EntryType entry, bo
             (~(3ULL << sub_index * 2) & entry_mask) | (static_cast<u64>(entry) << sub_index * 2);
     } else {
         position = position >> page_bits;
-        const u64 entry_mask = entries[position / 32];
+        const size_t word = position / 32;
+        const u64 entry_mask = entries[word];
         const size_t sub_index = position % 32;
-        entries[position / 32] =
+        const u64 next =
             (~(3ULL << sub_index * 2) & entry_mask) | (static_cast<u64>(entry) << sub_index * 2);
+        if (next != entry_mask) {
+            entries.GetAndFault(word) = next;
+        }
     }
 }
 
