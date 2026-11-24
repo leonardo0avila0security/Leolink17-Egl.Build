@@ -202,3 +202,22 @@ if(NOT MSVC)
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-parameter>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-field-initializers>)
 endif()
+
+if(LINUX AND ENABLE_CUBEB)
+    target_sources(tests PRIVATE audio_core/cubeb_recovery.cpp)
+    target_link_libraries(tests PRIVATE cubeb::cubeb)
+    foreach(function init destroy get_max_channel_count get_min_latency
+                     stream_init stream_destroy stream_start stream_stop)
+        target_link_options(tests PRIVATE "-Wl,--wrap=cubeb_${function}")
+    endforeach()
+endif()
+
+if(LINUX)
+    target_sources(tests PRIVATE audio_core/sdl_recovery.cpp)
+    target_link_libraries(tests PRIVATE SDL3::SDL3)
+    foreach(function WasInit GetAudioPlaybackDevices GetAudioDeviceName OpenAudioDeviceStream
+                     AddEventWatch RemoveEventWatch DestroyAudioStream
+                     ResumeAudioStreamDevice PauseAudioStreamDevice GetAudioStreamFormat)
+        target_link_options(tests PRIVATE "-Wl,--wrap=SDL_${function}")
+    endforeach()
+endif()

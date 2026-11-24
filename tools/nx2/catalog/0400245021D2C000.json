@@ -1,0 +1,8 @@
+{
+ "title": "0400245021D2C000",
+ "game": "Yoshi and the Mysterious Book",
+ "notes": "",
+ "programs": [
+  {"key": "e6896e2921f2338b", "hash": "51c95e80b80fcb42", "stage": "pixel", "object": "Title movie YUV-to-RGB pass", "how": "The Vulkan frame capture linked the 1920×1080 movie target to the title composition. The render-target trace matched its native fragment program.", "notes": "Samples the luma and chroma planes before the title UI is composited.", "source": "Yoshi 1.0.2, Eglantine nx2-experimental 192c6de372, Vulkan emulated GPU", "updated": "2026-11-22T13:14:38Z"}
+ ]
+}
