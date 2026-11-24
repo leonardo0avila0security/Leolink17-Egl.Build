@@ -363,6 +363,11 @@ public:
     /// Remove images in a region
     void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
+    /// Copy one depth slice of a 3D surface to another
+    bool CopyVolumeSlice(const Tegra::Engines::Fermi2D::Surface& dst,
+                         const Tegra::Engines::Fermi2D::Surface& src,
+                         const Tegra::Engines::Fermi2D::Config& copy);
+
     /// Blit an image with the given parameters
     bool BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                    const Tegra::Engines::Fermi2D::Surface& src,
