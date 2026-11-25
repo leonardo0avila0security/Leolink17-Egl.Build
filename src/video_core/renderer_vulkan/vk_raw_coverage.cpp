@@ -57,6 +57,18 @@ RawCoverageRings::RawCoverageRings(const Device& device, MemoryAllocator& alloca
 
 RawCoverageRings::~RawCoverageRings() = default;
 
+bool RawCoverageRings::HasNonNullMisses() const noexcept {
+    if (!valid) {
+        return false;
+    }
+    const u8* const mapped = rings[active].buffer.Mapped().data();
+    u32 total = 0;
+    u32 nulls = 0;
+    std::memcpy(&total, mapped + Cov::RING_COUNTER_WORD * sizeof(u32), sizeof(total));
+    std::memcpy(&nulls, mapped + Cov::RING_NULL_WORD * sizeof(u32), sizeof(nulls));
+    return total > (std::min)(nulls, Cov::NULL_RECORDS);
+}
+
 u64 RawCoverageRings::Use(Queue& queue) {
     Ring& ring{rings[active]};
     ++ring.dispatches;
@@ -71,20 +83,21 @@ u64 RawCoverageRings::Use(Queue& queue) {
 }
 
 const RawCoverageRings::Window* RawCoverageRings::Poll(std::chrono::steady_clock::time_point now,
-                                                       Queue& queue) {
+                                                       Queue& queue, bool force_swap) {
     if (pending) {
         return queue.IsDone(pending_tick) ? &pending_window : nullptr;
     }
     const auto elapsed{std::chrono::duration_cast<std::chrono::seconds>(now - window_start)};
-    if (elapsed.count() < static_cast<s64>(VideoCommon::RAW_COVERAGE_WINDOW_SECONDS)) {
+    Ring& old{rings[active]};
+    if (force_swap) {
+        if (old.dispatches == 0) {
+            return nullptr;
+        }
+    } else if (elapsed.count() < static_cast<s64>(VideoCommon::RAW_COVERAGE_WINDOW_SECONDS)) {
         return nullptr;
     }
-    // The shaders' writes to the old ring become visible to the host once this completes (and
-    // every earlier use of the ring has).
-    queue.HostReadBarrier();
-    Ring& old{rings[active]};
+    const bool already_done = force_swap && queue.IsDone(old.last_tick);
     pending = true;
-    pending_tick = (std::max)(old.last_tick, queue.CurrentTick());
     pending_window = Window{
         .bytes = old.buffer.Mapped(),
         .dispatches = old.dispatches,
@@ -92,6 +105,14 @@ const RawCoverageRings::Window* RawCoverageRings::Poll(std::chrono::steady_clock
     };
     active ^= 1;
     window_start = now;
+    if (already_done) {
+        pending_tick = old.last_tick;
+        return &pending_window;
+    }
+    // The shaders' writes to the old ring become visible to the host once this completes (and
+    // every earlier use of the ring has).
+    queue.HostReadBarrier();
+    pending_tick = (std::max)(old.last_tick, queue.CurrentTick());
     return nullptr;
 }
 

@@ -455,6 +455,9 @@ void PipelineCache::Impl::NoteCompileTime(std::string_view kind, u64 hash,
 PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
     : device{device_}, options{std::move(options_)}, profile{MakeProfile(device_)},
       host_info{MakeHostInfo(device_, profile)} {
+    if (options.raw_miss_reporting && profile.support_raw_global_memory) {
+        host_info.raw_coverage = true;
+    }
     try_generation_at_init = Common::DiagRequest::TrySwitchGeneration();
     const VkPhysicalDeviceProperties props = device.GetPhysical().GetProperties();
     disk_header.revision = options.revision;
@@ -490,6 +493,9 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
                                        ? Disk::TranslationEpoch()
                                        : std::string_view{options.translation_epoch};
     TranslationSwitches switches = CurrentTranslationSwitches();
+    if (options.raw_miss_reporting && profile.support_raw_global_memory) {
+        switches.raw_coverage = true;
+    }
     switches.tensor_lowering = static_cast<u8>(tensor_lowering);
     disk_header.translation_key = Disk::MakeTranslationKey({
         .epoch = epoch,

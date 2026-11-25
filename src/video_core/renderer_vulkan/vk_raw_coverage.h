@@ -54,13 +54,18 @@ public:
         return valid;
     }
 
+    /// True when the active ring has recorded at least one non-null miss since creation or reset.
+    [[nodiscard]] bool HasNonNullMisses() const noexcept;
+
     /// A table about to be used by a draw or dispatch recorded on `queue`: the device address of
     /// the active ring (it stamps the present number the shaders copy into their records).
     [[nodiscard]] u64 Use(Queue& queue);
 
-    /// Swaps the rings when the window is over; returns the old ring once the GPU is done with it.
-    /// Call Recycle after reading it.
-    [[nodiscard]] const Window* Poll(std::chrono::steady_clock::time_point now, Queue& queue);
+    /// Swaps the rings when the window is over (or immediately when `force_swap` is true and at
+    /// least one dispatch has used the active ring); returns the old ring once the GPU is done
+    /// with it. Call Recycle after reading it.
+    [[nodiscard]] const Window* Poll(std::chrono::steady_clock::time_point now, Queue& queue,
+                                     bool force_swap = false);
     void Recycle();
 
     /// At shutdown, with the GPU idle: the misses counted in the active (unfinished) window.

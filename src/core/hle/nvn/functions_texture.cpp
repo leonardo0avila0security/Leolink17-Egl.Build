@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/alignment.h"
 #include "common/boot_counter.h"
 #include "common/logging.h"
 #include "core/hle/nvn/hle_call.h"
@@ -1990,6 +1991,23 @@ void TexelAccess(Call& c, bool write, u64 texture, u64 view_va, u64 region_va, u
         return;
     }
 
+    const u64 stride =
+        Common::AlignUpLog2(u64{cols} * block.bytes, Tegra::Texture::GOB_SIZE_X_SHIFT);
+    const u64 gobs_in_x = stride >> Tegra::Texture::GOB_SIZE_X_SHIFT;
+    const u32 x_shift = Tegra::Texture::GOB_SIZE_SHIFT + tile_h + tile_d;
+    const u64 block_size = gobs_in_x << x_shift;
+    const u32 block_height_mask = (1u << tile_h) - 1u;
+    const u64 min_by = first_row >> Tegra::Texture::GOB_SIZE_Y_SHIFT;
+    const u64 max_by = (first_row + rows - 1) >> Tegra::Texture::GOB_SIZE_Y_SHIFT;
+    const u64 min_gx = (first_column_blocks * block.bytes) >> Tegra::Texture::GOB_SIZE_X_SHIFT;
+    const u64 max_gx =
+        ((first_column_blocks + region_cols) * block.bytes - 1) >> Tegra::Texture::GOB_SIZE_X_SHIFT;
+    const u64 calc_touch_begin = (min_by >> tile_h) * block_size + (min_gx << x_shift) +
+                                 ((min_by & block_height_mask) << Tegra::Texture::GOB_SIZE_SHIFT);
+    const u64 calc_touch_end =
+        (max_by >> tile_h) * block_size + (max_gx << x_shift) +
+        (((max_by & block_height_mask) + 1) << Tegra::Texture::GOB_SIZE_SHIFT);
+
     for (u32 slice = 0; slice < slice_count; ++slice) {
         u64 begin = 0;
         u64 end = 0;
@@ -1997,12 +2015,36 @@ void TexelAccess(Call& c, bool write, u64 texture, u64 view_va, u64 region_va, u
             bad("empty level");
             return;
         }
-        std::vector<u8> bytes(static_cast<size_t>(end - begin));
+        const u64 level_size = end - begin;
+        const bool narrowed = calc_touch_begin < calc_touch_end && calc_touch_end <= level_size &&
+                              calc_touch_begin <= 0xFFFFFFFFull;
+        const u64 touch_begin = narrowed ? calc_touch_begin : 0;
+        const u64 touch_size = narrowed ? (calc_touch_end - calc_touch_begin) : level_size;
+        const u32 base_offset = static_cast<u32>(touch_begin);
         const u64 guest_level = binding->address + begin;
-        if (!c.mem.Read(guest_level, bytes.data(), bytes.size())) {
-            bad("storage is not guest memory (virtual pool?)");
-            return;
+        const u64 touch_va = guest_level + touch_begin;
+        constexpr u64 PAGE_SIZE = 4096;
+        u8* direct_ptr = c.mem.Pointer(touch_va);
+        if (direct_ptr != nullptr && touch_size > 0) {
+            u64 offset = PAGE_SIZE - (touch_va & (PAGE_SIZE - 1));
+            while (offset < touch_size) {
+                if (c.mem.Pointer(touch_va + offset) != direct_ptr + offset) {
+                    direct_ptr = nullptr;
+                    break;
+                }
+                offset += PAGE_SIZE;
+            }
         }
+        std::vector<u8> bytes;
+        if (direct_ptr == nullptr) {
+            bytes.resize(static_cast<size_t>(touch_size));
+            if (!c.mem.Read(touch_va, bytes.data(), bytes.size())) {
+                bad("storage is not guest memory (virtual pool?)");
+                return;
+            }
+        }
+        const std::span<u8> tiled_span{direct_ptr != nullptr ? direct_ptr : bytes.data(),
+                                       static_cast<size_t>(touch_size)};
         const u64 caller = data + slice * image_pitch;
         // Packed host scratch (row_bytes per row, bounded by the level): the guest row stride
         // only places the rows in guest memory.
@@ -2015,23 +2057,24 @@ void TexelAccess(Call& c, bool write, u64 texture, u64 view_va, u64 region_va, u
                     return;
                 }
             }
-            Tegra::Texture::SwizzleSubrect(bytes, linear_bytes, block.bytes, cols, level_rows, 1,
-                                           static_cast<u32>(first_column_blocks),
+            Tegra::Texture::SwizzleSubrect(tiled_span, linear_bytes, block.bytes, cols, level_rows,
+                                           1, static_cast<u32>(first_column_blocks),
                                            static_cast<u32>(first_row), region_cols,
                                            static_cast<u32>(rows), tile_h, tile_d,
-                                           static_cast<u32>(row_bytes), true);
-            writes.Storage(guest_level, bytes.size());
-            if (!c.mem.Write(guest_level, bytes.data(), bytes.size())) {
+                                           static_cast<u32>(row_bytes), true, base_offset);
+            writes.Storage(touch_va, touch_size);
+            if (direct_ptr == nullptr &&
+                !c.mem.Write(touch_va, tiled_span.data(), tiled_span.size())) {
                 bad("guest memory access failed");
                 return;
             }
             continue;
         }
-        Tegra::Texture::UnswizzleSubrect(linear_bytes, bytes, block.bytes, cols, level_rows, 1,
+        Tegra::Texture::UnswizzleSubrect(linear_bytes, tiled_span, block.bytes, cols, level_rows, 1,
                                          static_cast<u32>(first_column_blocks),
                                          static_cast<u32>(first_row), region_cols,
                                          static_cast<u32>(rows), tile_h, tile_d,
-                                         static_cast<u32>(row_bytes), true);
+                                         static_cast<u32>(row_bytes), true, base_offset);
         for (u64 y = 0; y < rows; ++y) {
             writes.Caller(caller + y * pitch, row_bytes);
             if (!c.mem.Write(caller + y * pitch, linear_bytes.data() + y * row_bytes,

@@ -77,6 +77,11 @@ public:
     VkResult Import(void* ptr, VkDeviceSize size, VkBufferUsageFlags usage, ImportedBuffer& out,
                     std::string& error) const;
 
+    /// Probes whether importing a MAP_SHARED / memfd-backed host mapping succeeds (Linux amdgpu
+    /// userptr rejects non-anonymous VMAs with VK_ERROR_INVALID_EXTERNAL_HANDLE_KHR).
+    [[nodiscard]] bool ProbeSharedMapping(VkBufferUsageFlags usage, std::string& error,
+                                          VkResult& out_result) const;
+
     /// Gives every page of [ptr, ptr + size) its host page before an import. Pages nobody has
     /// touched yet have none: vkAllocateMemory would fault each one in (43 ms for 256 MiB) while
     /// it holds the driver lock every vkQueueSubmit of the device waits for. Reading one byte per

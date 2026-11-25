@@ -436,6 +436,9 @@ struct PipelineCacheOptions {
     /// LoadDiskResources), then Complete; nothing when the cache file holds no pipelines. Null:
     /// nothing is reported.
     VideoCore::LoadProgressSink* load_progress{};
+    /// Emit raw-global miss reporting instructions so unbacked mirror pools can be demand-promoted
+    /// when host memory import is disabled or unavailable.
+    bool raw_miss_reporting{false};
 };
 
 struct PipelineCacheStats {

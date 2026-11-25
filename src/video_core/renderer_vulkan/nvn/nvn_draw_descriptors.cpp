@@ -962,9 +962,15 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         }
     }
     if (layout.uses_raw_global_memory) {
+        InFlight& raw_flight = host->HostFlight();
+        if (VideoCommon::RawCoverageEnabled() || !impl.HostImportEnabled()) {
+            coverage_ring = impl.RawCoverageRingFor(raw_flight.seq);
+            if (coverage_ring != 0) {
+                host->HostNeedHostReadBarrier();
+            }
+        }
         raw_table = &impl.RawGlobalMemoryTable();
         impl.stats.raw_global_draws.fetch_add(1, std::memory_order_relaxed);
-        InFlight& raw_flight = host->HostFlight();
         if (raw_noted_seq != raw_flight.seq || raw_noted_generation != raw_table->generation) {
             raw_noted_seq = raw_flight.seq;
             raw_noted_generation = raw_table->generation;
@@ -994,12 +1000,6 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                 if (alias_table->device) {
                     raw_flight.keepalive.push_back(alias_table->device);
                 }
-            }
-        }
-        if (VideoCommon::RawCoverageEnabled()) {
-            coverage_ring = impl.RawCoverageRingFor(raw_flight.seq);
-            if (coverage_ring != 0) {
-                host->HostNeedHostReadBarrier();
             }
         }
     }
@@ -2070,6 +2070,17 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
             need = true;
         }
     }
+    if (plan.raw_global && !impl.raw_table.mirror_pools.empty()) {
+        for (Pool* const mp : impl.raw_table.mirror_pools) {
+            if (host->HostMirrorNeedsUpload(*mp, 0, mp->size)) {
+                if (!need) {
+                    cause = BreakCause::MirrorUpload;
+                }
+                need = true;
+                break;
+            }
+        }
+    }
     if ((plan.flush_inline && !inline_updates.empty()) || !plan.uniform_copies.empty()) {
         if (!need) {
             cause = BreakCause::InlineUpdate;
@@ -2138,6 +2149,11 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
         for (const DrawPlan::RangeUse& use : plan.ranges) {
             if (use.pool->backing == Pool::Backing::Mirror) {
                 host->HostUploadRange(*use.pool, use.offset, use.size);
+            }
+        }
+        if (plan.raw_global) {
+            for (Pool* const mp : impl.raw_table.mirror_pools) {
+                host->HostUploadRange(*mp, 0, mp->size);
             }
         }
         if (shadow.any) {

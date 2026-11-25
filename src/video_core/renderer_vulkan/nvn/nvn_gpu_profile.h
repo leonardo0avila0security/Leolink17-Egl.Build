@@ -153,6 +153,9 @@ public:
 
     /// Nesting depth of `Scope`s (only the outermost one measures).
     u32 depth{0};
+    /// Incremented when a segment ends so scopes still alive across a mid-scope flush do not
+    /// stamp an already-ended command buffer.
+    u32 segment_epoch{0};
     /// Submission sequence number (the frame timeline lines name it).
     u64 seq{0};
     /// EDEN_NX2_NVN_COSTSPLIT: the schedule slot the submission was recorded in (-1: none) and
@@ -210,6 +213,7 @@ private:
     Flight* flight_{};
     vk::CommandBuffer cmd_{};
     u32 begin_{NONE};
+    u32 segment_epoch_{0};
     bool outermost_{false};
     u64 units_{};
     u32 split_{};

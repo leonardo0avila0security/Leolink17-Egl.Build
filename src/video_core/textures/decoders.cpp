@@ -139,7 +139,8 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
 template <bool TO_LINEAR, u32 BYTES_PER_PIXEL>
 void SwizzleSubrectImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32 height,
                         u32 depth, u32 origin_x, u32 origin_y, u32 extent_x, u32 num_lines,
-                        u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling) {
+                        u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling,
+                        u32 base_offset) {
     // The origin of the transformation can be configured here, leave it as zero as the current API
     // doesn't expose it.
     static constexpr u32 origin_z = 0;
@@ -183,11 +184,12 @@ void SwizzleSubrectImpl(std::span<u8> output, std::span<const u8> input, u32 wid
                 const u32 base_swizzled_offset = offset_z + offset_y + offset_x;
                 const u32 swizzled_offset = NativeGobOffset(base_swizzled_offset + (swizzled_x | swizzled_y), native_tiling);
 
+                const u32 tiled_offset = swizzled_offset - base_offset;
                 const u32 unswizzled_offset =
                     slice * pitch * height + line * pitch + column * BYTES_PER_PIXEL;
 
-                u8* const dst = &output[TO_LINEAR ? swizzled_offset : unswizzled_offset];
-                const u8* const src = &input[TO_LINEAR ? unswizzled_offset : swizzled_offset];
+                u8* const dst = &output[TO_LINEAR ? tiled_offset : unswizzled_offset];
+                const u8* const src = &input[TO_LINEAR ? unswizzled_offset : tiled_offset];
 
                 std::memcpy(dst, src, BYTES_PER_PIXEL);
             }
@@ -253,13 +255,14 @@ void SwizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_p
 
 void SwizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
                     u32 height, u32 depth, u32 origin_x, u32 origin_y, u32 extent_x, u32 extent_y,
-                    u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling) {
+                    u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling,
+                    u32 base_offset) {
     switch (bytes_per_pixel) {
 #define BPP_CASE(x)                                                                                \
     case x:                                                                                        \
         return SwizzleSubrectImpl<true, x>(output, input, width, height, depth, origin_x,          \
                                            origin_y, extent_x, extent_y, block_height,             \
-                                           block_depth, pitch_linear, native_tiling);
+                                           block_depth, pitch_linear, native_tiling, base_offset);
         BPP_CASE(1)
         BPP_CASE(2)
         BPP_CASE(3)
@@ -277,13 +280,15 @@ void SwizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_p
 
 void UnswizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
                       u32 width, u32 height, u32 depth, u32 origin_x, u32 origin_y, u32 extent_x,
-                      u32 extent_y, u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling) {
+                      u32 extent_y, u32 block_height, u32 block_depth, u32 pitch_linear,
+                      bool native_tiling, u32 base_offset) {
     switch (bytes_per_pixel) {
 #define BPP_CASE(x)                                                                                \
     case x:                                                                                        \
         return SwizzleSubrectImpl<false, x>(output, input, width, height, depth, origin_x,         \
                                             origin_y, extent_x, extent_y, block_height,            \
-                                            block_depth, pitch_linear, native_tiling);
+                                            block_depth, pitch_linear, native_tiling,              \
+                                            base_offset);
         BPP_CASE(1)
         BPP_CASE(2)
         BPP_CASE(3)

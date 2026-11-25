@@ -5,6 +5,12 @@
 #include <bit>
 #include <chrono>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/nvn/nvn_host_import.h"
@@ -356,6 +362,53 @@ VkResult HostImporter::CreateBufferInChunk(const ImportedChunk& chunk, VkDeviceS
     }
     out = std::move(buffer);
     return VK_SUCCESS;
+}
+
+bool HostImporter::ProbeSharedMapping(VkBufferUsageFlags usage, std::string& error,
+                                      VkResult& out_result) const {
+    if (!Available()) {
+        error = "VK_EXT_external_memory_host is not available";
+        out_result = VK_ERROR_EXTENSION_NOT_PRESENT;
+        return false;
+    }
+#if defined(__linux__) && defined(__NR_memfd_create)
+#ifndef MFD_CLOEXEC
+    constexpr unsigned int MFD_CLOEXEC = 0x0001U;
+#endif
+    const VkDeviceSize size = min_alignment;
+    const long raw_fd = syscall(__NR_memfd_create, "nvn-import-probe", MFD_CLOEXEC);
+    if (raw_fd < 0) {
+        out_result = VK_SUCCESS;
+        return true;
+    }
+    const int fd = static_cast<int>(raw_fd);
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        close(fd);
+        out_result = VK_SUCCESS;
+        return true;
+    }
+    void* const ptr = mmap(nullptr, static_cast<size_t>(size), PROT_READ | PROT_WRITE, MAP_SHARED,
+                           fd, 0);
+    if (ptr == MAP_FAILED) {
+        close(fd);
+        out_result = VK_SUCCESS;
+        return true;
+    }
+    static_cast<volatile u8*>(ptr)[0] = 0;
+    ImportedBuffer probe_buf;
+    const VkResult result = Import(ptr, size, usage, probe_buf, error);
+    // Destroy the imported VkBuffer and VkDeviceMemory before unmapping the backing VMA.
+    probe_buf = {};
+    munmap(ptr, static_cast<size_t>(size));
+    close(fd);
+    out_result = result;
+    return result == VK_SUCCESS;
+#else
+    static_cast<void>(usage);
+    error.clear();
+    out_result = VK_SUCCESS;
+    return true;
+#endif
 }
 
 } // namespace Vulkan::Nvn

@@ -215,6 +215,7 @@ PipelineCache& DrawResources::Cache() {
         options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
         options.shader_notify = impl.options.shader_notify;
         options.load_progress = impl.options.load_progress;
+        options.raw_miss_reporting = !impl.HostImportEnabled();
         cache_instance = std::make_unique<PipelineCache>(impl.device, std::move(options));
     }
     return *cache_instance;
@@ -240,6 +241,7 @@ void DrawResources::OpenCache(u64 title_id) {
     options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
     options.shader_notify = impl.options.shader_notify;
     options.load_progress = impl.options.load_progress;
+    options.raw_miss_reporting = !impl.HostImportEnabled();
     if (options.async_compile) {
         LOG_INFO(Render_Vulkan,
                  "[nvn] asynchronous shaders on: run-time pipeline compiles run on workers; the "

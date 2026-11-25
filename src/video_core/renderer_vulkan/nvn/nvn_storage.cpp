@@ -776,6 +776,9 @@ bool Context::Impl::EnsureImage(Storage& s) {
     s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     s.last_used_present = stats.presents.load(std::memory_order_relaxed);
     stats.storages_created.fetch_add(1, std::memory_order_relaxed);
+    if (!s.sparse && s.image && s.image.IsUnbacked()) {
+        s.vram_bytes = 0;
+    }
     if (s.cached) {
         storage_cache_bytes += s.vram_bytes;
         TrimStorageCache();
@@ -1497,6 +1500,7 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // A pass walks the whole cache: it runs when the cache has grown since the last one or after
     // a few presents, not at every storage created.
     constexpr u64 PASS_INTERVAL_PRESENTS = 120;
+    constexpr u64 HARD_PRESSURE_INTERVAL_PRESENTS = 2;
     // Superseded-storage tests per pass (each scans the storages over the tested one's bytes).
     constexpr size_t MAX_SUPERSEDED_TESTS = 1024;
     const u64 presents = stats.presents.load(std::memory_order_relaxed);
@@ -1511,7 +1515,19 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         // device-local allocations over the budget (EDEN_NX2_TRY_VMA_DEVICE_STRICT) bring it
         // forward: the driver pages until the cache sheds what it can rebuild.
         const u64 strict_over_budget = spills.over_budget_count.load(std::memory_order_relaxed);
-        if (presents < trim_next_present && strict_over_budget == trim_seen_over_budget) {
+        bool hard_pressure_due = false;
+        if (mario_kart_world && presents >= trim_hard_next_present) {
+            const u64 budget = device.GetDeviceMemoryBudget();
+            if (budget != 0 &&
+                device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack() >
+                    budget + budget / 4) {
+                hard_pressure_due = true;
+            } else {
+                trim_hard_next_present = presents + HARD_PRESSURE_INTERVAL_PRESENTS;
+            }
+        }
+        if (presents < trim_next_present && strict_over_budget == trim_seen_over_budget &&
+            !hard_pressure_due) {
             return;
         }
         trim_seen_over_budget = strict_over_budget;
@@ -1523,32 +1539,44 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // VK_EXT_memory_budget, the allocator's empty block space counts and the driver counts it too)
     // sheds rebuildable storages before spills begin.
     u64 device_budget = 0;
+    u64 device_used = 0;
     trim_device_excess = 0;
     bool hard_pressure = false;
+    const auto refresh_pressure = [&](bool count_pass) {
+        if (trim_legacy || device_budget == 0) {
+            return;
+        }
+        device_used = device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack();
+        const u64 pressure_threshold = mario_kart_world
+                                           ? device_budget - (device_budget * 15) / 100
+                                           : device_budget - device_budget / 10;
+        hard_pressure = mario_kart_world && device_used > device_budget + device_budget / 4;
+        if (device_used > pressure_threshold) {
+            trim_device_excess = device_used - pressure_threshold;
+            if (count_pass &&
+                !(!at_present && mario_kart_world && !over_budget && !hard_pressure)) {
+                stats.storage_trim_pressure_passes.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            trim_device_excess = 0;
+        }
+    };
     if (!trim_legacy) {
         device_budget = device.GetDeviceMemoryBudget();
-        if (device_budget != 0) {
-            const u64 used = device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack();
-            const u64 pressure_threshold = mario_kart_world
-                                               ? device_budget - (device_budget * 15) / 100
-                                               : device_budget - device_budget / 10;
-            hard_pressure = mario_kart_world && used > device_budget;
-            if (used > pressure_threshold) {
-                trim_device_excess = used - pressure_threshold;
-                if (!(!at_present && mario_kart_world && !over_budget && !hard_pressure)) {
-                    stats.storage_trim_pressure_passes.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        }
+        refresh_pressure(true);
     }
     if (!at_present && mario_kart_world && !over_budget && !hard_pressure) {
         return;
     }
-    if (trim_device_excess != 0 && image_recycle_count != 0) {
-        const u64 freed = image_recycle_bytes;
-        ClearRecycledImages();
-        trim_device_excess -= (std::min)(trim_device_excess, freed);
+    if (trim_device_excess != 0) {
+        RetireCompleted();
+        if (image_recycle_count != 0) {
+            ClearRecycledImages();
+        }
+        refresh_pressure(false);
     }
+    const bool emergency_pressure =
+        hard_pressure && device_budget != 0 && device_used > device_budget + device_budget / 2;
     constexpr size_t MAX_SOFT_PRESSURE_OPS_PER_PASS = 48;
     constexpr u64 SOFT_PRESSURE_INTERVAL_PRESENTS = 4;
     const bool soft_pressure_capped =
@@ -1556,7 +1584,14 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     size_t pressure_ops = 0;
     const u64 budget_target = storage_cache_budget / 10 * 9;
     u64 target = over_budget ? budget_target : storage_cache_bytes;
-    if (trim_device_excess != 0) {
+    if (hard_pressure) {
+        const u64 hard_target_device = device_budget + device_budget / 4;
+        const u64 hard_excess = device_used > hard_target_device ? device_used - hard_target_device : 0;
+        const u64 shed = hard_excess + device_budget / 16;
+        const u64 min_target = emergency_pressure ? device_budget / 4 : device_budget / 2;
+        target = (std::min)(
+            target, (std::max)(min_target, storage_cache_bytes - (std::min)(storage_cache_bytes, shed)));
+    } else if (trim_device_excess != 0) {
         // The excess and a margin, so that the next pass does not find the device over at once.
         const u64 shed = trim_device_excess + device_budget / 32;
         target = (std::min)(target, storage_cache_bytes - (std::min)(storage_cache_bytes, shed));
@@ -1648,7 +1683,8 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // evicted, recreated, and alias-transferred every frame.
     constexpr u64 PRESSURE_KEEP_PRESENTS = 4;
     const auto kept_recently_used = [&](const Storage& storage) {
-        return !hard_pressure && presents >= storage.last_used_present &&
+        return !hard_pressure && storage_cache_bytes <= budget_target &&
+               presents >= storage.last_used_present &&
                presents - storage.last_used_present < PRESSURE_KEEP_PRESENTS;
     };
     // First the render targets the GPU wrote again since (the game re-uses the bytes for other
@@ -1682,17 +1718,22 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // If live CPU-sourced (guest memory) textures keep the cache over target (e.g., MKW keeping
     // thousands of Texture objects registered), demote the oldest idle images at present boundaries
     // while keeping the Storage entry intact so EnsureImage can rebuild them on future use.
-    if (at_present && storage_cache_bytes > target && retire_seq != 0 &&
+    if ((at_present || emergency_pressure) && storage_cache_bytes > target &&
         !(soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
         const u64 done_seq = completed_seq.load(std::memory_order_acquire);
         constexpr u64 DEMOTE_KEEP_PRESENTS_PRESSURE = 60;
         constexpr u64 DEMOTE_KEEP_PRESENTS_BUDGET = 180;
-        const u64 demote_keep =
-            trim_device_excess != 0 ? DEMOTE_KEEP_PRESENTS_PRESSURE : DEMOTE_KEEP_PRESENTS_BUDGET;
+        constexpr size_t MAX_MIDFRAME_DEMOTE_OPS = 32;
+        const bool midframe_demote = !at_present && emergency_pressure;
+        size_t demote_ops = 0;
+        const u64 demote_keep = hard_pressure           ? PRESSURE_KEEP_PRESENTS
+                              : trim_device_excess != 0 ? DEMOTE_KEEP_PRESENTS_PRESSURE
+                                                        : DEMOTE_KEEP_PRESENTS_BUDGET;
         std::vector<Candidate> demotable;
         for (const auto& [key, storage] : storage_cache) {
             if (storage.use_count() <= 1 || !storage->image || storage->sparse || storage->scaled ||
-                storage->origin != StorageOrigin::Cpu || storage->last_used_seq > done_seq) {
+                storage->origin != StorageOrigin::Cpu || storage->last_used_seq > done_seq ||
+                storage->touched_seq > done_seq) {
                 continue;
             }
             if (presents >= storage->last_used_present &&
@@ -1703,7 +1744,8 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         std::sort(demotable.begin(), demotable.end(), by_age);
         for (const Candidate& candidate : demotable) {
             if (storage_cache_bytes <= target ||
-                (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
+                (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS) ||
+                (midframe_demote && demote_ops >= MAX_MIDFRAME_DEMOTE_OPS)) {
                 break;
             }
             const auto it = storage_cache.find(candidate.key);
@@ -1711,14 +1753,12 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
                 continue;
             }
             Storage& s = *it->second;
-            auto old_image = std::make_shared<vk::Image>(std::move(s.image));
-            auto old_views = std::make_shared<std::vector<vk::ImageView>>(
-                draw_resources ? draw_resources->TakeStorageViews(s)
-                               : std::vector<vk::ImageView>{});
-            retired.push_back({retire_seq, [old_image, old_views]() mutable {
-                                   old_views->clear();
-                                   *old_image = vk::Image{};
-                               }});
+            std::vector<vk::ImageView> views = draw_resources
+                                                   ? draw_resources->TakeStorageViews(s)
+                                                   : std::vector<vk::ImageView>{};
+            // GPU already completed every submission touching `s` and framebuffers are per-flight:
+            // drop views before the image right now to release device memory immediately.
+            views.clear();
             s.image = vk::Image{};
             s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             s.contents_valid = false;
@@ -1730,6 +1770,7 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
             storage_cache_bytes -= (std::min)(storage_cache_bytes, s.vram_bytes);
             stats.storages_evicted.fetch_add(1, std::memory_order_relaxed);
             ++pressure_ops;
+            ++demote_ops;
         }
     }
     // Under the budget too: render targets nothing used for `trim_age_presents` that cost nothing
@@ -1766,6 +1807,13 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     trim_next_present =
         presents + (soft_pressure_incomplete ? SOFT_PRESSURE_INTERVAL_PRESENTS
                                              : PASS_INTERVAL_PRESENTS);
+    if (hard_pressure) {
+        trim_hard_next_present = presents + HARD_PRESSURE_INTERVAL_PRESENTS;
+        if (Debug::Get().storage_census && presents >= census_next_present) {
+            LogStorageCensus();
+            census_next_present = presents + 20;
+        }
+    }
     stats.storage_cache_bytes.store(storage_cache_bytes, std::memory_order_relaxed);
 }
 

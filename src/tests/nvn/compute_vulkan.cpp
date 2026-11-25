@@ -4899,3 +4899,132 @@ TEST_CASE("NVN inline uniform: misaligned DeviceLocal UBO preserves GPU writes p
     CHECK(rig.context.Stats().ops_failed == 0);
     CHECK(rig.context.Stats().ops_unsupported == 0);
 }
+
+TEST_CASE("nvn compute: raw global memory demand-promotes mirror pools without host import",
+          "[nvn][compute][raw]") {
+    struct Switch2Scope {
+        const bool previous = Settings::CurrentProgramIsSwitch2();
+        const Settings::GraphicsPath previous_path = Settings::values.graphics_path.GetValue();
+        Switch2Scope() {
+            Settings::SetCurrentProgramIsSwitch2(true);
+            Settings::values.graphics_path.SetValue(Settings::GraphicsPath::Hle);
+        }
+        ~Switch2Scope() {
+            Settings::values.graphics_path.SetValue(previous_path);
+            Settings::SetCurrentProgramIsSwitch2(previous);
+        }
+    } const switch2_scope;
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->IsBufferDeviceAddressSupported() ||
+        !vulkan->device->IsShaderInt64Supported() ||
+        !vulkan->device->IsDescriptorAliasingSupported()) {
+        SKIP("raw global memory prerequisites unavailable");
+    }
+    FakeMemory memory;
+    constexpr u64 POOL_SIZE = 64_KiB;
+    constexpr u64 INPUT_VA = POOL_VA;
+    constexpr u64 MID_VA = POOL_VA + 2 * POOL_SIZE;
+    constexpr u64 OUT_VA = POOL_VA + 4 * POOL_SIZE;
+    constexpr u64 UNUSED_VA = POOL_VA + 6 * POOL_SIZE;
+    u8* const input = memory.Add(INPUT_VA, POOL_SIZE);
+    u8* const mid = memory.Add(MID_VA, POOL_SIZE);
+    u8* const out = memory.Add(OUT_VA, POOL_SIZE);
+    u8* const unused = memory.Add(UNUSED_VA, POOL_SIZE);
+    std::memset(input, 0, POOL_SIZE);
+    std::memset(mid, 0, POOL_SIZE);
+    std::memset(out, 0, POOL_SIZE);
+    std::memset(unused, 0, POOL_SIZE);
+
+    constexpr u32 INITIAL_INPUT = 0x13572468;
+    std::memcpy(input, &INITIAL_INPUT, sizeof(INITIAL_INPUT));
+
+    Vulkan::Nvn::Context context(
+        *vulkan->device, vulkan->submit_mutex, nullptr,
+        {.allow_host_import = false,
+         .background_backing = false,
+         .early_submit = false,
+         .try_storage_vram = true,
+         .mirror_hash_tracked = true});
+    context.SetGuestMemory(&memory);
+    context.CreatePool(
+        {.serial = 1, .guest_address = INPUT_VA, .size = POOL_SIZE, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 2, .guest_address = MID_VA, .size = POOL_SIZE, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 3, .guest_address = OUT_VA, .size = POOL_SIZE, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 4, .guest_address = UNUSED_VA, .size = POOL_SIZE, .flags = POOL_CPU_CACHED});
+
+    const std::array<Inst, 5> pure_raw_write{MovC0(2, 0x10), MovC0(3, 0x14),
+                                             AddImm(6, 255, 0x1234), Stg(2, 6), Exit};
+    constexpr u64 PROGRAM_PURE_RAW_WRITE = 210;
+    context.CreateProgram(
+        MakeProgram(PROGRAM_RAW_READ, RawReadProgram(), {.push_words = 2, .storage = 1}));
+    context.CreateProgram(
+        MakeProgram(PROGRAM_PURE_RAW_WRITE, pure_raw_write, {.push_words = 2}));
+
+    u64 seq = 0;
+    const auto submit_and_wait = [&](std::vector<u64> list, std::initializer_list<u64> used) {
+        PushEnd(list);
+        context.Submit(MakeSubmission(++seq, std::move(list), used));
+        REQUIRE(context.Wait(seq, 20s));
+    };
+
+    // Submission 1: INPUT_VA is pending and not bound via descriptors, so the raw miss ring records
+    // the miss while the load returns 0.
+    {
+        std::vector<u64> list;
+        BindCompute(list, PROGRAM_RAW_READ, OUT_VA, 4096);
+        PushRawAddress(list, INPUT_VA);
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 1, .y = 1, .z = 1});
+        submit_and_wait(std::move(list), {1, 3, PROGRAM_RAW_READ});
+        CHECK(WordAt(out, 0) == 0u);
+    }
+
+    // Submission 2: polls the completed ring, demand-promotes INPUT_VA, rebuilds the raw global
+    // table, and immediately reads 0x13572468.
+    {
+        std::vector<u64> list;
+        BindCompute(list, PROGRAM_RAW_READ, OUT_VA, 4096);
+        PushRawAddress(list, INPUT_VA);
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 1, .y = 1, .z = 1});
+        submit_and_wait(std::move(list), {1, 3, PROGRAM_RAW_READ});
+        CHECK(WordAt(out, 0) == INITIAL_INPUT);
+    }
+
+    // Submission 3: subsequent CPU writes to the promoted mirror pool reach the raw global table.
+    constexpr u32 UPDATED_INPUT = 0x24681357;
+    memory.CpuWrite(INPUT_VA, &UPDATED_INPUT, sizeof(UPDATED_INPUT));
+    {
+        std::vector<u64> list;
+        BindCompute(list, PROGRAM_RAW_READ, OUT_VA, 4096);
+        PushRawAddress(list, INPUT_VA);
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 1, .y = 1, .z = 1});
+        submit_and_wait(std::move(list), {1, 3, PROGRAM_RAW_READ});
+        CHECK(WordAt(out, 0) == UPDATED_INPUT);
+    }
+
+    // Submissions 4 & 5: pending store target MID_VA is demand-promoted on raw store miss, then
+    // receives the GPU store visible to subsequent GPU work.
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<u64> list;
+        Push(list, VC::Op::BindProgram,
+             VC::BindProgramPayload{.program_serial = PROGRAM_PURE_RAW_WRITE, .stages = 1u << 5});
+        PushRawAddress(list, MID_VA);
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 1, .y = 1, .z = 1});
+        submit_and_wait(std::move(list), {2, PROGRAM_PURE_RAW_WRITE});
+    }
+    {
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyBufferToBuffer,
+             VC::CopyBufferToBufferPayload{.src = MID_VA, .dst = OUT_VA, .size = 4});
+        submit_and_wait(std::move(list), {2, 3});
+        CHECK(WordAt(out, 0) == 0x1234u);
+    }
+
+    const Vulkan::Nvn::ContextStats stats = context.Stats();
+    CHECK(stats.pools_imported == 0);
+    CHECK(stats.pools_mirrored == 3u);
+    CHECK(stats.ops_failed == 0);
+    CHECK(stats.ops_unsupported == 0);
+}

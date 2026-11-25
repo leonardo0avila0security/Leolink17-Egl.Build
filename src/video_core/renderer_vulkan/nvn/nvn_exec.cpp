@@ -360,6 +360,9 @@ public:
         // A raw pointer reaches any range of the table: no submit-time uniform copy of them.
         impl.uniform_snapshots.NoteRawWrite(impl.raw_table.generation, impl.raw_table.entries,
                                             flight.seq);
+        if (!impl.raw_table.mirror_pools.empty()) {
+            ++impl.mirror_raw_write_epoch;
+        }
     }
     void HostNoteShadowedWrite(const Pool& pool, u64 offset, u64 size) override {
         impl.NoteNonInlinePoolWrite(pool.address + offset, size, flight.seq);
@@ -751,6 +754,10 @@ private:
     /// through the pool's byte layout (nvn_alias_gpu.h), for textures whose layouts differ.
     /// False with `why` set when it cannot be expressed (nothing recorded).
     bool TransferOverlapBytes(Storage& source, Storage& destination, const char*& why);
+    /// Returns a reusable device-local scratch buffer of at least `total` bytes for GPU untiles.
+    /// When `needs_reuse_barrier` is set, the caller must emit a TRANSFER_READ ->
+    /// COMPUTE_SHADER_WRITE barrier before writing into the buffer.
+    VkBuffer AcquireUntileScratch(u64 total, bool& needs_reuse_barrier);
     /// CopyBufferToTexture into a decoded stand-in (ASTC/BCn): decodes the source blocks on the
     /// CPU.
     bool DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
@@ -909,6 +916,8 @@ private:
     std::unordered_set<Storage*> linear_writeback_set;
     std::vector<std::shared_ptr<Storage>> touched;
     std::unordered_set<Storage*> touched_set;
+    std::shared_ptr<ShadowChunk> untile_scratch;
+    bool untile_scratch_used{false};
 };
 
 void Recorder::BeginSegment(bool keep_shadows) {
@@ -1274,10 +1283,13 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
             continue;
         }
         const bool settled = tracked && coverage == MirrorWriteCoverage::None;
+        const bool hash_fresh = !pool.raw_mirror_enabled || !pool.split_runs.empty() || !tracked ||
+                                page.raw_epoch == impl.mirror_raw_write_epoch;
         ++hashed;
-        if (page.valid && page.hash == GuestPageHash(pool, index)) {
+        if (page.valid && hash_fresh && page.hash == GuestPageHash(pool, index)) {
             page.checked = stamp;
-            page.raw_epoch = pool.split_raw_epoch_seen;
+            page.raw_epoch =
+                pool.split_runs.empty() ? impl.mirror_raw_write_epoch : pool.split_raw_epoch_seen;
             page.trusted = settled;
             continue;
         }
@@ -1338,14 +1350,17 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
         }
         const bool settled = tracked && coverage == MirrorWriteCoverage::None;
         const bool partial_gpu = coverage == MirrorWriteCoverage::Partial;
+        const bool hash_fresh = !pool.raw_mirror_enabled || !pool.split_runs.empty() || !tracked ||
+                                page.raw_epoch == impl.mirror_raw_write_epoch;
         ++hashed;
         const u64 hash = GuestPageHash(pool, index);
-        const bool changed = !page.valid || page.hash != hash;
+        const bool changed = !page.valid || !hash_fresh || page.hash != hash;
         if (!partial_gpu) {
             page.hash = hash;
             page.valid = true;
             page.checked = stamp;
-            page.raw_epoch = pool.split_raw_epoch_seen;
+            page.raw_epoch =
+                pool.split_runs.empty() ? impl.mirror_raw_write_epoch : pool.split_raw_epoch_seen;
             page.trusted = settled;
         } else {
             page.valid = false;
@@ -2347,8 +2362,14 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
     const UploadPlan& tail_plan = sparse.TailPlan();
     const u64 tail_bytes = layout.TailSize();
     const auto align = [](u64 value) { return (value + 63) / 64 * 64; };
-    // One staging buffer per chunk of at most 64 MiB.
-    constexpr u64 CHUNK_BYTES = u64{64} << 20;
+    // One staging buffer per chunk of at most 32 MiB; bulk multi-chunk uploads reuse a single
+    // local upload buffer and flush between chunks so staging never piles up on host-visible heaps.
+    constexpr u64 CHUNK_BYTES = u64{32} << 20;
+    const u64 est_bytes = static_cast<u64>(uploads.tiles.size()) * align(tile_bytes) +
+                          static_cast<u64>(uploads.tails.size()) * align(tail_plan.staging_size);
+    const bool bulk_upload = est_bytes > CHUNK_BYTES && !draw.PassOpen() && !condition_open;
+    vk::Buffer local_staging;
+    u64 local_staging_size = 0;
     size_t next_tile = 0;
     size_t next_tail = 0;
     while (next_tile < uploads.tiles.size() || next_tail < uploads.tails.size()) {
@@ -2371,7 +2392,20 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
             total += tail_plan.staging_size;
             ++next_tail;
         }
-        const StagingRange staging = AllocStaging(total, 64);
+        StagingRange staging{};
+        if (bulk_upload) {
+            if (!local_staging || local_staging_size < total) {
+                const u64 alloc_size = (std::max)(total, CHUNK_BYTES);
+                local_staging = impl.CreateHostBuffer(alloc_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                                      MemoryUsage::Upload, AllocationKind::Staging);
+                local_staging_size = alloc_size;
+            }
+            staging.buffer = *local_staging;
+            staging.offset = 0;
+            staging.pointer = local_staging.Mapped().data();
+        } else {
+            staging = AllocStaging(total, 64);
+        }
         std::vector<u64> tile_pools(tile_offsets.size(), 0);
         std::vector<u32> tile_gens(tile_offsets.size(), 0);
         if (impl.tex_hash_tracked) {
@@ -2452,6 +2486,9 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                          .count(),
                      sparse.MappedTiles(), sparse.BoundBytes() / 1048576.0);
         }
+        if (bulk_upload) {
+            local_staging.Flush();
+        }
         if (regions.empty()) {
             continue;
         }
@@ -2481,6 +2518,10 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                 // Prepare cleared the dirty flags; failed uploads must be retried.
                 sparse.MarkAllDirty();
                 s.contents_valid = false;
+                if (bulk_upload && local_staging) {
+                    flight.keepalive.push_back(
+                        std::make_shared<vk::Buffer>(std::move(local_staging)));
+                }
                 return;
             }
         } else {
@@ -2488,6 +2529,9 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                                     regions);
         }
         barrier_pending = true;
+        if (bulk_upload) {
+            FlushAndWait();
+        }
     }
     // From here on the contents are the guest's bytes (a texture the GPU wrote keeps its origin).
     if (s.origin == StorageOrigin::None) {
@@ -3011,9 +3055,7 @@ bool Recorder::UploadUntileOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
         impl.EnsureBacking(pool); // the guest's initial bytes into the buffer, once
         direct = pool.backing == Pool::Backing::DeviceLocal && !pool.upload_pending;
     }
-    u64 output_size = 0;
-    u64 input_size = 0;
-    for (UploadPiece& piece : linear.pieces) {
+    for (const UploadPiece& piece : linear.pieces) {
         UntileGpu::Piece gpu{
             .input_offset = 0,
             .output_offset = 0,
@@ -3032,13 +3074,6 @@ bool Recorder::UploadUntileOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
                                 piece.width, piece.height, piece.depth, s.desc.format));
             return false;
         }
-        output_size = align(output_size);
-        piece.staging_offset = output_size;
-        gpu.output_offset = output_size;
-        output_size += piece.staging_size;
-        input_size = align(input_size);
-        gpu.input_offset = input_size;
-        input_size += needed;
         if (piece.guest_offset + needed > size ||
             (s.pool_offset + piece.guest_offset) % untile->OffsetAlignment() != 0) {
             direct = false;
@@ -3048,85 +3083,198 @@ bool Recorder::UploadUntileOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
     if (pieces.empty()) {
         return false;
     }
-    std::shared_ptr<vk::Buffer> output;
-    try {
-        // Whole 32-bit words: the shader's u32 view of the last piece's range.
-        output = std::make_shared<vk::Buffer>(impl.CreateHostBuffer(
-            (output_size + 3) & ~u64{3},
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            MemoryUsage::DeviceLocal));
-    } catch (const vk::Exception& exception) {
-        LogOnce(fmt::format("GPU untile: no device-local output buffer ({}), untiled on the CPU",
-                            exception.what()));
-        return false;
-    }
-    VkBuffer input = VK_NULL_HANDLE;
-    if (direct) {
-        for (size_t i = 0; i < pieces.size(); ++i) {
+    constexpr u64 CHUNK_LIMIT = u64{32} << 20;
+    struct UntileChunk {
+        size_t begin{};
+        size_t end{};
+        u64 output_size{};
+        u64 input_size{};
+    };
+    std::vector<UntileChunk> chunks;
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        const u64 out_bytes = linear.pieces[i].staging_size;
+        const u64 in_bytes = UntileGpu::InputSize(pieces[i]);
+        const bool need_new =
+            chunks.empty() || align(chunks.back().output_size) + out_bytes > CHUNK_LIMIT ||
+            (!direct && align(chunks.back().input_size) + in_bytes > CHUNK_LIMIT);
+        if (need_new) {
+            chunks.push_back(UntileChunk{.begin = i, .end = i});
+        }
+        UntileChunk& cur = chunks.back();
+        cur.output_size = align(cur.output_size);
+        linear.pieces[i].staging_offset = cur.output_size;
+        pieces[i].output_offset = cur.output_size;
+        cur.output_size += out_bytes;
+        if (!direct) {
+            cur.input_size = align(cur.input_size);
+            pieces[i].input_offset = cur.input_size;
+            cur.input_size += in_bytes;
+        } else {
             pieces[i].input_offset = s.pool_offset + linear.pieces[i].guest_offset;
         }
+        cur.end = i + 1;
+    }
+    if (direct && draw.HasShadows()) {
         // The shader reads the pool's bytes through host memory: storage shadows over them first
         // (FlushPending below orders their copies before the dispatches).
-        if (draw.HasShadows()) {
-            draw.FlushShadowsOverlapping(pool, s.pool_offset, size);
-        }
-        input = pool.Handle();
-    } else {
-        // The tiled bytes as they are (a copy, not an untile), zero-padded to whole GOBs, in 1 MiB
-        // slices over the decode workers: one thread fills fresh upload memory slower than the
-        // CPU untile's workers do (OoT's 288 MiB D16 storage: 381 ms against 189 ms).
-        constexpr u64 COPY_SLICE = u64{1} << 20;
-        struct Slice {
-            u8* destination;
-            const u8* source;
-            u64 copy; ///< bytes from `source`
-            u64 zero; ///< zero bytes after them
-        };
-        const StagingRange staging = AllocStaging(input_size, alignment);
-        std::vector<Slice> slices;
-        for (size_t i = 0; i < pieces.size(); ++i) {
-            const u64 guest_offset = linear.pieces[i].guest_offset;
-            const u64 needed = UntileGpu::InputSize(pieces[i]);
-            const u64 available = (std::min)(needed, size - guest_offset);
-            u8* const destination = staging.pointer + pieces[i].input_offset;
-            for (u64 offset = 0; offset < needed; offset += COPY_SLICE) {
-                const u64 end = (std::min)(offset + COPY_SLICE, needed);
-                const u64 copy = offset < available ? (std::min)(end, available) - offset : 0;
-                slices.push_back({destination + offset,
-                                  copy != 0 ? data + guest_offset + offset : nullptr, copy,
-                                  end - offset - copy});
-            }
-            pieces[i].input_offset += staging.offset;
-        }
-        const auto fill = [&slices](size_t index) {
-            const Slice& slice = slices[index];
-            if (slice.copy != 0) {
-                std::memcpy(slice.destination, slice.source, static_cast<size_t>(slice.copy));
-            }
-            if (slice.zero != 0) {
-                std::memset(slice.destination + slice.copy, 0, static_cast<size_t>(slice.zero));
-            }
-        };
-        if (input_size >= COPY_SLICE) {
-            RunParallel(slices.size(), fill);
-        } else {
-            for (size_t i = 0; i < slices.size(); ++i) {
-                fill(i);
-            }
-        }
-        input = staging.buffer;
+        draw.FlushShadowsOverlapping(pool, s.pool_offset, size);
     }
-    FlushPending(); // earlier writes of the pool's bytes before the shader reads them
-    untile->Record(Cmd(), input, **output, pieces);
-    barrier_pending = true; // the shader's writes before the copy reads them
-    const bool saved = track_writes;
-    track_writes = false;
-    PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-    track_writes = saved;
-    Cmd().CopyBufferToImage(**output, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            MakeUploadRegions(s, linear, 0));
-    flight.keepalive.push_back(std::move(output));
-    barrier_pending = true;
+    const std::vector<VkBufferImageCopy> all_regions = MakeUploadRegions(s, linear, 0);
+    u64 max_small_out = 0;
+    for (const UntileChunk& chunk : chunks) {
+        const u64 out_alloc = (chunk.output_size + 3) & ~u64{3};
+        if (out_alloc <= CHUNK_LIMIT) {
+            max_small_out = (std::max)(max_small_out, out_alloc);
+        }
+    }
+    for (const UntileChunk& chunk : chunks) {
+        const u64 out_alloc_size = (chunk.output_size + 3) & ~u64{3};
+        const bool giant_output = out_alloc_size > CHUNK_LIMIT;
+        const bool giant_input = !direct && chunk.input_size > CHUNK_LIMIT;
+        const bool can_flush = !draw.PassOpen() && !condition_open;
+        const bool flush_giant = (giant_output || giant_input) && can_flush;
+
+        VkBuffer output_handle = VK_NULL_HANDLE;
+        std::shared_ptr<vk::Buffer> local_output;
+        bool needs_reuse_barrier = false;
+        if (!giant_output) {
+            output_handle = AcquireUntileScratch(max_small_out, needs_reuse_barrier);
+            if (output_handle == VK_NULL_HANDLE) {
+                return false;
+            }
+        } else {
+            try {
+                local_output = std::make_shared<vk::Buffer>(impl.CreateHostBuffer(
+                    out_alloc_size,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    MemoryUsage::DeviceLocal));
+            } catch (const vk::Exception& exception) {
+                if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                    throw;
+                }
+                LogOnce(fmt::format("GPU untile: no device-local output buffer ({}), untiled on the CPU",
+                                    exception.what()));
+                return false;
+            }
+            output_handle = **local_output;
+        }
+
+        VkBuffer input = VK_NULL_HANDLE;
+        vk::Buffer local_staging;
+        if (direct) {
+            input = pool.Handle();
+        } else {
+            // The tiled bytes as they are (a copy, not an untile), zero-padded to whole GOBs, in
+            // 1 MiB slices over the decode workers: one thread fills fresh upload memory slower
+            // than the CPU untile's workers do (OoT's 288 MiB D16 storage: 381 ms against 189 ms).
+            constexpr u64 COPY_SLICE = u64{1} << 20;
+            struct Slice {
+                u8* destination;
+                const u8* source;
+                u64 copy; ///< bytes from `source`
+                u64 zero; ///< zero bytes after them
+            };
+            u8* staging_ptr = nullptr;
+            u64 staging_offset = 0;
+            if (flush_giant) {
+                try {
+                    local_staging = impl.CreateHostBuffer(chunk.input_size,
+                                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                          MemoryUsage::Upload,
+                                                          AllocationKind::Staging);
+                } catch (const vk::Exception& exception) {
+                    if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                        throw;
+                    }
+                    LogOnce(fmt::format("GPU untile staging allocation ({} bytes) failed: {}",
+                                        chunk.input_size, exception.what()));
+                    return false;
+                }
+                input = *local_staging;
+                staging_ptr = local_staging.Mapped().data();
+            } else {
+                try {
+                    const StagingRange staging = AllocStaging(chunk.input_size, alignment);
+                    input = staging.buffer;
+                    staging_offset = staging.offset;
+                    staging_ptr = staging.pointer;
+                } catch (const vk::Exception& exception) {
+                    if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                        throw;
+                    }
+                    LogOnce(fmt::format("GPU untile staging allocation ({} bytes) failed: {}",
+                                        chunk.input_size, exception.what()));
+                    return false;
+                }
+            }
+            std::vector<Slice> slices;
+            for (size_t i = chunk.begin; i < chunk.end; ++i) {
+                const u64 guest_offset = linear.pieces[i].guest_offset;
+                const u64 needed = UntileGpu::InputSize(pieces[i]);
+                const u64 available = (std::min)(needed, size - guest_offset);
+                u8* const destination = staging_ptr + pieces[i].input_offset;
+                for (u64 offset = 0; offset < needed; offset += COPY_SLICE) {
+                    const u64 end = (std::min)(offset + COPY_SLICE, needed);
+                    const u64 copy = offset < available ? (std::min)(end, available) - offset : 0;
+                    slices.push_back({destination + offset,
+                                      copy != 0 ? data + guest_offset + offset : nullptr, copy,
+                                      end - offset - copy});
+                }
+                pieces[i].input_offset += staging_offset;
+            }
+            const auto fill = [&slices](size_t index) {
+                const Slice& slice = slices[index];
+                if (slice.copy != 0) {
+                    std::memcpy(slice.destination, slice.source, static_cast<size_t>(slice.copy));
+                }
+                if (slice.zero != 0) {
+                    std::memset(slice.destination + slice.copy, 0,
+                                static_cast<size_t>(slice.zero));
+                }
+            };
+            if (chunk.input_size >= COPY_SLICE) {
+                RunParallel(slices.size(), fill);
+            } else {
+                for (size_t i = 0; i < slices.size(); ++i) {
+                    fill(i);
+                }
+            }
+            if (flush_giant) {
+                local_staging.Flush();
+            }
+        }
+
+        FlushPending(); // earlier writes of the pool's bytes before the shader reads them
+        if (needs_reuse_barrier) {
+            const VkMemoryBarrier reuse_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            };
+            Cmd().PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, reuse_barrier);
+        }
+        untile->Record(Cmd(), input, output_handle,
+                       std::span<const UntileGpu::Piece>{pieces.data() + chunk.begin,
+                                                         chunk.end - chunk.begin});
+        barrier_pending = true; // the shader's writes before the copy reads them
+        const bool saved = track_writes;
+        track_writes = false;
+        PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+        track_writes = saved;
+        Cmd().CopyBufferToImage(output_handle, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                vk::Span<VkBufferImageCopy>{all_regions.data() + chunk.begin,
+                                                            chunk.end - chunk.begin});
+        barrier_pending = true;
+        if (flush_giant) {
+            FlushAndWait();
+            untile_scratch_used = false;
+        } else if (local_output) {
+            flight.keepalive.push_back(std::move(local_output));
+        }
+    }
     impl.stats.untile_gpu_uploads.fetch_add(1, std::memory_order_relaxed);
     impl.stats.untile_gpu_bytes.fetch_add(linear.staging_size, std::memory_order_relaxed);
     if (direct) {
@@ -3203,6 +3351,27 @@ void Recorder::RefreshFromGuest(Storage& s) {
     if (s.force_upload) {
         UploadStorage(s);
     }
+}
+
+VkBuffer Recorder::AcquireUntileScratch(u64 total, bool& needs_reuse_barrier) {
+    needs_reuse_barrier = false;
+    if (!impl.draw_resources) {
+        return VK_NULL_HANDLE;
+    }
+    if (!untile_scratch || untile_scratch->size < total) {
+        std::shared_ptr<ShadowChunk> chunk = impl.draw_resources->AcquireShadow(total);
+        if (!chunk) {
+            return VK_NULL_HANDLE;
+        }
+        chunk->used = chunk->size;
+        untile_scratch = std::move(chunk);
+        flight.scratch_shadows.push_back(untile_scratch);
+        untile_scratch_used = false;
+    } else if (untile_scratch_used) {
+        needs_reuse_barrier = true;
+    }
+    untile_scratch_used = true;
+    return *untile_scratch->buffer;
 }
 
 void Recorder::ResolveOverlaps(Storage& s) {
@@ -3567,7 +3736,8 @@ bool Recorder::TransferOverlapBytes(Storage& source, Storage& destination, const
             why = "no scratch memory for the transfer";
             return false;
         }
-        flight.shadow.push_back(scratch);
+        scratch->used = scratch->size;
+        flight.scratch_shadows.push_back(scratch);
         alias_scratch = std::move(scratch);
     }
 

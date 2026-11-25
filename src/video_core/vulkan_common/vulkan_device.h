@@ -392,9 +392,10 @@ public:
         return IsSparseResidencyImage2DSupported() && features.features.sparseResidencyAliased;
     }
 
-    /// Whether images with no memory bound may be sampled and used as attachments. AMD's drivers
-    /// fault on it (the GPU hangs shortly after the first such draw), so large images there are
-    /// backed normally. RADV is counted in until someone shows it doesn't need it.
+    /// Whether images with no memory bound may be sampled and used as attachments. AMD's proprietary
+    /// drivers fault on it (the GPU hangs shortly after the first such draw), so large images there
+    /// are backed normally. Mesa RADV is allowed when residencyNonResidentStrict guarantees unbound
+    /// reads return zero and writes are discarded.
     /// EDEN_NX2_SPARSE_UNBACKED=1 allows unbound images on any driver, =0 on none.
     bool CanUseUnbackedSparseImages() const {
         static const char forced = [] {
@@ -405,8 +406,10 @@ public:
             return forced == '1';
         }
         const VkDriverIdKHR id = GetDriverID();
-        return id != VK_DRIVER_ID_AMD_PROPRIETARY && id != VK_DRIVER_ID_AMD_OPEN_SOURCE &&
-               id != VK_DRIVER_ID_MESA_RADV;
+        if (id == VK_DRIVER_ID_MESA_RADV) {
+            return properties.properties.sparseProperties.residencyNonResidentStrict == VK_TRUE;
+        }
+        return id != VK_DRIVER_ID_AMD_PROPRIETARY && id != VK_DRIVER_ID_AMD_OPEN_SOURCE;
     }
 
     /// Whether a pipeline cache can be read while pipelines build into it, as Vulkan allows. Intel's

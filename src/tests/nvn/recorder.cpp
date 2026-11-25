@@ -1106,3 +1106,114 @@ TEST_CASE("nvn recorder: infinite wait timeout and threads", "[nvn]") {
     gpu.join();
     CHECK(f.recorder.CompletedSeq() == 1);
 }
+
+TEST_CASE("nvn recorder: finalized textures and samplers stay alive while registered in descriptor pools",
+          "[nvn]") {
+    Fixture f;
+    REQUIRE(f.recorder.TextureInitialize(Obj(10), MakeTextureDesc(), Fixture::POOL, 0));
+    REQUIRE(f.recorder.TextureInitialize(Obj(11), MakeTextureDesc(), Fixture::POOL, 0x10000));
+    REQUIRE(f.recorder.TexturePoolInitialize(Obj(20), Fixture::POOL, 0x20000, 64));
+
+    std::array<u8, 16> view{};
+    view[0] = GUEST_VIEW_SET_LEVELS;
+    view[2] = 0; // base_level
+    view[3] = 1; // nlevels
+    f.memory.Put(SCRATCH, view);
+
+    f.recorder.RegisterTexture(Obj(20), 1, Obj(10), 0);
+    f.recorder.RegisterTexture(Obj(20), 2, Obj(11), SCRATCH);
+
+    SamplerDesc sampler{};
+    sampler.min_filter = 2;
+    REQUIRE(f.recorder.SamplerPoolInitialize(Obj(30), Fixture::POOL, 0x30000, 16));
+    REQUIRE(f.recorder.SamplerInitialize(Obj(31), sampler));
+    f.recorder.RegisterSampler(Obj(30), 1, Obj(31));
+
+    REQUIRE(f.sink.textures.size() == 3);
+    REQUIRE(f.sink.samplers.size() == 1);
+    const u64 base_serial = f.sink.textures[0].serial;
+    const u64 view_base_serial = f.sink.textures[1].serial;
+    const u64 view_serial = f.sink.textures[2].serial;
+    const u64 sampler_serial = f.sink.samplers[0].serial;
+    REQUIRE(f.sink.textures[2].view_of == view_base_serial);
+
+    // Finalizing the CPU structs clears guest tags, but registered pool slots stay valid.
+    f.recorder.TextureFinalize(Obj(10));
+    f.recorder.TextureFinalize(Obj(11));
+    f.recorder.SamplerFinalize(Obj(31));
+    CHECK_FALSE(f.recorder.GetTexture(Obj(10)).has_value());
+    CHECK_FALSE(f.recorder.GetTexture(Obj(11)).has_value());
+    CHECK_FALSE(f.recorder.GetSampler(Obj(31)).has_value());
+
+    f.sink.Complete(f.recorder.LastSeq());
+    f.recorder.FlushDestroys();
+    CHECK(f.sink.destroyed.empty());
+    const TextureHolderCounts counts = f.recorder.PublishTextureHolders();
+    CHECK(counts.retiring == 0);
+    CHECK(f.sink.holders.serials.empty());
+
+    // A submission recorded after finalize still observes the registered base, view, and sampler.
+    const u64 after_finalize = f.Record(0, [] {});
+    const u64 seq = f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{after_finalize});
+    REQUIRE(seq == 1);
+    REQUIRE(f.sink.submissions.size() == 1);
+    REQUIRE(f.sink.submissions[0].texture_pool_snapshot.size() > 2);
+    CHECK(f.sink.submissions[0].texture_pool_snapshot[1] == base_serial);
+    CHECK(f.sink.submissions[0].texture_pool_snapshot[2] == view_serial);
+    REQUIRE(f.sink.submissions[0].sampler_pool_snapshot.size() > 1);
+    CHECK(f.sink.submissions[0].sampler_pool_snapshot[1] == sampler_serial);
+
+    // Unregistering slot 1 while `seq` is in flight waits for `seq` to finish before destroying.
+    f.recorder.RegisterTexture(Obj(20), 1, 0, 0);
+    f.recorder.FlushDestroys();
+    CHECK(f.sink.destroyed.empty());
+
+    f.sink.Complete(seq);
+    f.recorder.FlushDestroys();
+    CHECK(f.sink.destroyed == std::vector<u64>{base_serial});
+
+    // Finalizing the descriptor pools releases the remaining finalized view, its base, and sampler.
+    f.recorder.TexturePoolFinalize(Obj(20));
+    f.recorder.SamplerPoolFinalize(Obj(30));
+    f.recorder.FlushDestroys();
+    CHECK(Destroyed(f, view_serial));
+    CHECK(Destroyed(f, view_base_serial));
+    CHECK(Destroyed(f, sampler_serial));
+
+    // Finalizing the backing memory pool tears down registered finalized textures so VRAM cannot leak.
+    constexpr u64 POOL2_STORAGE = STORAGE + STORAGE_SIZE;
+    REQUIRE(f.recorder.MemoryPoolInitialize(Obj(40), POOL2_STORAGE, 0x10000, 0));
+    const u64 pool2_serial = f.sink.pools.back().serial;
+    REQUIRE(f.recorder.TextureInitialize(Obj(41), MakeTextureDesc(), Obj(40), 0));
+    const u64 tex2_base_serial = f.sink.textures.at(3).serial;
+    REQUIRE(f.recorder.TexturePoolInitialize(Obj(42), Fixture::POOL, 0x40000, 16));
+    f.recorder.RegisterTexture(Obj(42), 3, Obj(41), SCRATCH);
+    REQUIRE(f.sink.textures.size() == 5);
+    const u64 tex2_view_serial = f.sink.textures.at(4).serial;
+    REQUIRE(f.sink.textures[4].view_of == tex2_base_serial);
+
+    f.recorder.TextureFinalize(Obj(41));
+    f.recorder.FlushDestroys();
+    CHECK_FALSE(Destroyed(f, tex2_base_serial));
+    CHECK_FALSE(Destroyed(f, tex2_view_serial));
+
+    const u64 seq2 = f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{after_finalize});
+    REQUIRE(seq2 == 2);
+    REQUIRE(f.sink.submissions.back().texture_pool_snapshot.size() > 3);
+    CHECK(f.sink.submissions.back().texture_pool_snapshot[3] == tex2_view_serial);
+    f.sink.Complete(seq2);
+    f.recorder.FlushDestroys();
+    CHECK_FALSE(Destroyed(f, tex2_base_serial));
+    CHECK_FALSE(Destroyed(f, tex2_view_serial));
+
+    f.recorder.MemoryPoolFinalize(Obj(40));
+    f.recorder.FlushDestroys();
+    CHECK(Destroyed(f, tex2_view_serial));
+    CHECK(Destroyed(f, tex2_base_serial));
+    CHECK(Destroyed(f, pool2_serial));
+
+    const u64 seq3 = f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{after_finalize});
+    REQUIRE(seq3 == 3);
+    const IdSnapshot& cleared_snap = f.sink.submissions.back().texture_pool_snapshot;
+    CHECK((cleared_snap.size() <= 3 || cleared_snap[3] == 0));
+}

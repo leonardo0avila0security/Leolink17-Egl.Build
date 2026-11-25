@@ -248,6 +248,7 @@ void Flight::MarkOp(vk::CommandBuffer cmd, u16 op, bool inside_render_pass) {
 }
 
 void Flight::EndOps(vk::CommandBuffer cmd) {
+    ++segment_epoch;
     if (!per_op || op_begin == NONE) {
         return;
     }
@@ -264,12 +265,13 @@ void Scope::Begin(vk::CommandBuffer cmd, const Tag& tag, u64 units, u32 split) n
     tag_ = tag;
     units_ = units;
     split_ = split;
+    segment_epoch_ = flight_->segment_epoch;
     begin_ = flight_->Stamp(cmd);
 }
 
 void Scope::End() noexcept {
     --flight_->depth;
-    if (!outermost_ || begin_ == NONE) {
+    if (!outermost_ || begin_ == NONE || segment_epoch_ != flight_->segment_epoch) {
         return;
     }
     const u32 end = flight_->Stamp(cmd_);
