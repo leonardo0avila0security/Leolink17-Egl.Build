@@ -1691,6 +1691,12 @@ void Device::RemoveUnsuitableExtensions() {
     features.mesh_shader.multiviewMeshShader = VK_FALSE;
     features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
     features.mesh_shader.meshShaderQueries = VK_FALSE;
+    LOG_INFO(Render_Vulkan,
+             "VK_EXT_mesh_shader: extension{} taskShader={} meshShader={} -> enabled={}",
+             loaded_extensions.contains(VK_EXT_MESH_SHADER_EXTENSION_NAME) ? "" : " NOT loaded",
+             static_cast<unsigned>(features.mesh_shader.taskShader),
+             static_cast<unsigned>(features.mesh_shader.meshShader),
+             features.mesh_shader.taskShader && features.mesh_shader.meshShader);
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
     // The mesh_shader_mode setting: leave VK_EXT_mesh_shader disabled for the compute fallback a
     // device without it uses. AMD runs task shaders on a compute queue ganged with the graphics
