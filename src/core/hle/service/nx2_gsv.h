@@ -1790,6 +1790,7 @@ public:
             {111, &INx2Vi2Session::StubReplyZeroed, "Unknown111"},
             {112, &INx2Vi2Session::StubReplyZeroed, "Unknown112"},
             {113, &INx2Vi2Session::StubReplyZeroed, "Unknown113"},
+            {201, &INx2Vi2Session::StubReplyZeroed, "Unknown201"},
             {202, &INx2Vi2Session::StubReplyZeroed, "Unknown202"},
             {230, &INx2Vi2Session::StubReplyZeroed, "Unknown230"},
             {231, &INx2Vi2Session::StubReplyZeroed, "Unknown231"},
@@ -4150,10 +4151,16 @@ private:
     void CalculateRequirements(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         auto layout = Nx2CalculateImageLayout(w + 2);
-        // Star Fox's NVN window textures use 4 KiB pool offsets. Reporting the block-linear
-        // layout's 8 KiB alignment makes NativeWindow::Acquire reject those textures.
-        if (system.GetApplicationProcessProgramID() == 0x0400E88025B1A000ULL) {
+        // These titles place their NVN window textures at 4 KiB pool offsets. Reporting the
+        // block-linear layout's 8 KiB alignment makes NativeWindow::Acquire reject those textures
+        // (Xenoblade 2's NativeWindow::Initialize fails and Acquire calls through a null window).
+        switch (system.GetApplicationProcessProgramID()) {
+        case 0x0400E88025B1A000ULL: // Star Fox
+        case 0x0400E95004038001ULL: // Xenoblade Chronicles 2
             layout.alignment = 0x1000;
+            break;
+        default:
+            break;
         }
         LOG_DEBUG(Service, "nx2:gsv 1510 kind={} {}x{} block={} pitch={:#x} format={} -> size={:#x} align={:#x}",
                   w[3], layout.width, layout.height, layout.block_height_log2, layout.pitch, w[8],

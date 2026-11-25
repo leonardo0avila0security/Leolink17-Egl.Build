@@ -320,7 +320,8 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
             False(params.flags & Svc::CreateProcessFlag::DisableDeviceAddressSpaceMerge);
         R_TRY(m_page_table.Initialize(as_type, enable_aslr, enable_das_merge, !enable_aslr, pool,
                                       params.code_address, params.code_num_pages * PageSize,
-                                      m_system_resource, res_limit, m_memory, 0));
+                                      m_system_resource, res_limit, m_memory, 0,
+                                      params.program_id));
     }
     ON_RESULT_FAILURE_2 {
         m_page_table.Finalize();
@@ -422,7 +423,7 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
             False(params.flags & Svc::CreateProcessFlag::DisableDeviceAddressSpaceMerge);
         R_TRY(m_page_table.Initialize(as_type, enable_aslr, enable_das_merge, !enable_aslr, pool,
                                       params.code_address, code_size, m_system_resource, res_limit,
-                                      m_memory, aslr_space_start));
+                                      m_memory, aslr_space_start, params.program_id));
     }
     ON_RESULT_FAILURE_2 {
         m_page_table.Finalize();

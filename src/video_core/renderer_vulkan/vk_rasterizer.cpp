@@ -3190,7 +3190,6 @@ bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shade
 }
 
 bool RasterizerVulkan::FrameDumpDrawInputs(bool is_indexed, std::span<const u64> shader_hashes) {
-    static constexpr u32 BUFFER_CAP = 4U << 20;
     static constexpr u32 INDIRECT_WORDS = 64;
     const auto& regs = maxwell3d->regs;
     const auto& state = maxwell3d->draw_manager.draw_state;
@@ -3259,6 +3258,7 @@ bool RasterizerVulkan::FrameDumpDrawInputs(bool is_indexed, std::span<const u64>
             if (slot < 0 && !is_indexed) {
                 return;
             }
+            constexpr u32 BUFFER_CAP = 4U << 20;
             const u32 size = (std::min)(binding.size, BUFFER_CAP);
             FrameDump::VertexInput& input = inputs.emplace_back(FrameDump::VertexInput{
                 .slot = slot,

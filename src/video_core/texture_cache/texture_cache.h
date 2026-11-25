@@ -2334,12 +2334,38 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
     // a power of two: 1 GiB for 600 MiB of data), which can fail when memory is tight.
     constexpr u64 min_size = 64_MiB;
     constexpr u64 chunk_size = 32_MiB;
-    constexpr ImageFlagBits excluded = ImageFlagBits::Sparse | ImageFlagBits::Converted |
-                                       ImageFlagBits::AcceleratedUpload | ImageFlagBits::Unbacked |
-                                       ImageFlagBits::TrimmedLevels;
+    constexpr ImageFlagBits excluded = ImageFlagBits::Converted | ImageFlagBits::AcceleratedUpload |
+                                       ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels;
     if (True(image.flags & excluded) || image.info.type != ImageType::e2D ||
         MapSizeBytes(image) < min_size) {
         return false;
+    }
+    if (True(image.flags & ImageFlagBits::Sparse)) {
+        if (!image.info.maxwell_gob_layout || image.info.is_sparse ||
+            !gpu_memory->UsesNativeTiling() ||
+            !Tegra::Nx2InSparseRegion(image.gpu_addr, image.guest_size_bytes)) {
+            return false;
+        }
+        // Chunk reads walk the GPU page tables. Separate mappings are safe here if they
+        // cover the entire image and every device page has backing.
+        GPUVAddr backed_end = image.gpu_addr;
+        ForEachSparseSegment(image, [&](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
+            if (gpu_addr != backed_end) {
+                return true;
+            }
+            const DAddr end = cpu_addr + size;
+            for (DAddr addr = cpu_addr; addr < end;
+                 addr += Core::DEVICE_PAGESIZE - (addr & Core::DEVICE_PAGEMASK)) {
+                if (!device_memory.GetPointer<u8>(addr)) {
+                    return true;
+                }
+            }
+            backed_end += size;
+            return false;
+        });
+        if (backed_end != image.gpu_addr + image.guest_size_bytes) {
+            return false;
+        }
     }
     for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
         const std::array range{std::pair<u64, u64>{
@@ -3420,9 +3446,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         ++images_created;
     }
 
+    // The device's tiling, not the image's: Maxwell GOB images in a sparse region are split too.
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
         (new_info.is_sparse ||
-         (new_info.native_tiling &&
+         (gpu_memory->UsesNativeTiling() &&
           Tegra::Nx2InSparseRegion(new_image.gpu_addr, new_image.guest_size_bytes)))) {
         new_image.flags |= ImageFlagBits::Sparse;
     }
